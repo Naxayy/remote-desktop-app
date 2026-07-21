@@ -9,7 +9,7 @@
 
 use super::Frame;
 use anyhow::{Context, Result};
-use windows_core::Interface;
+use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
