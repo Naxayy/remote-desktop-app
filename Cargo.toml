@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "core-engine",
+    "agent",
+    "signaling-server",
+    "relay-server",
+]
+
+# Perfil optimizado para binarios de producción: el agente y el controller
+# necesitan baja latencia, así que compilamos con optimizaciones agresivas
+# y sin symbols de debug en los releases.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

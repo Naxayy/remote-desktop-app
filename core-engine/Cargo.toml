@@ -1,0 +1,21 @@
+[package]
+name = "core_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Motor central: captura de pantalla, codificacion de video, inyeccion de input y cifrado."
+
+[dependencies]
+# Manejo de errores
+thiserror = "1"
+anyhow = "1"
+
+# Async runtime (usado por el agente y para pipelines de captura/red)
+tokio = { version = "1", features = ["full"] }
+
+# Logging
+tracing = "0.1"
+
+# --- Se van a sumar en los proximos pasos, segun el modulo que ataquemos ---
+# windows = { version = "0.5", features = [...] }   # captura via DXGI (Windows)
+# openh264 / vpx-encode                              # codificacion de video
+# chacha20poly1305 / snow                            # cifrado end-to-end (Noise Protocol)

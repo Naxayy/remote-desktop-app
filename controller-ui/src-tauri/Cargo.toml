@@ -1,0 +1,15 @@
+[package]
+name = "controller-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Shell de Tauri para la app controladora (frontend web + backend Rust)."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+core_engine = { path = "../../core-engine" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

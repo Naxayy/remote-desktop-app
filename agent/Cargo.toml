@@ -1,0 +1,16 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+description = "Agente que corre en la PC remota: servicio de Windows + engine + conexion de red."
+
+[dependencies]
+core_engine = { path = "../core-engine" }
+tokio = { version = "1", features = ["full"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# --- Se suman en los proximos pasos ---
+# windows-service = "0.6"   # registrar/manejar el agente como servicio de Windows

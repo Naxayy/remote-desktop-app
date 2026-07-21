@@ -1,0 +1,13 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+
+# Node / Tauri frontend
+node_modules/
+dist/
+controller-ui/src-tauri/target/
+
+# Entornos
+.env
+*.log

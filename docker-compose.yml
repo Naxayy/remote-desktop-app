@@ -1,0 +1,26 @@
+# Infraestructura pensada para correr en el homelab (Docker + Cloudflare Tunnel).
+# El Cloudflare Tunnel se configura aparte (cloudflared) apuntando a estos
+# servicios internos - asi no hace falta abrir puertos en el router de casa.
+
+services:
+  signaling-server:
+    build:
+      context: .
+      dockerfile: docker/signaling-server/Dockerfile
+    container_name: rda-signaling
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+
+  relay-server:
+    build:
+      context: .
+      dockerfile: docker/relay-server/Dockerfile
+    container_name: rda-relay
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+    environment:
+      - RUST_LOG=info

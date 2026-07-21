@@ -1,0 +1,18 @@
+{
+  "productName": "controller-ui",
+  "version": "0.1.0",
+  "identifier": "com.nicolas.remotedesktopapp.controller",
+  "build": {
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../src"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Remote Desktop App - Controller",
+        "width": 1100,
+        "height": 720
+      }
+    ]
+  }
+}
