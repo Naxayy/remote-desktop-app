@@ -5,17 +5,26 @@ edition = "2021"
 description = "Motor central: captura de pantalla, codificacion de video, inyeccion de input y cifrado."
 
 [dependencies]
-# Manejo de errores
 thiserror = "1"
 anyhow = "1"
-
-# Async runtime (usado por el agente y para pipelines de captura/red)
 tokio = { version = "1", features = ["full"] }
-
-# Logging
 tracing = "0.1"
 
-# --- Se van a sumar en los proximos pasos, segun el modulo que ataquemos ---
-# windows = { version = "0.5", features = [...] }   # captura via DXGI (Windows)
-# openh264 / vpx-encode                              # codificacion de video
-# chacha20poly1305 / snow                            # cifrado end-to-end (Noise Protocol)
+# API de captura DXGI, solo se compila en Windows
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_System_Com",
+] }
+windows-core = "0.58"
+
+[dev-dependencies]
+minifb = "0.27"
+
+# --- Se van a sumar en los proximos pasos ---
+# openh264 / vpx-encode      # codificacion de video
+# chacha20poly1305 / snow    # cifrado end-to-end (Noise Protocol)
