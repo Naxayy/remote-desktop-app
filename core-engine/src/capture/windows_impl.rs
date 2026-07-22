@@ -22,9 +22,17 @@ use windows::Win32::Graphics::Dxgi::{
 };
 
 pub struct ScreenCapturer {
+    // Reservado para uso futuro (ej: encoding acelerado por GPU que
+    // comparta el mismo device). Por ahora next_frame() no lo necesita
+    // directamente porque la textura staging ya se crea una sola vez.
+    #[allow(dead_code)]
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     duplication: IDXGIOutputDuplication,
+    /// Textura de staging reusada en cada frame - crearla es una
+    /// llamada cara al driver de GPU, no tiene sentido repetirla 30
+    /// veces por segundo.
+    staging: ID3D11Texture2D,
     width: u32,
     height: u32,
 }
@@ -65,10 +73,33 @@ impl ScreenCapturer {
             let width = desc.ModeDesc.Width;
             let height = desc.ModeDesc.Height;
 
+            // Textura "staging": copia en la que la CPU si puede leer
+            // (la textura original de AcquireNextFrame vive solo en GPU).
+            // La creamos una unica vez y la reusamos en cada next_frame().
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging: Option<ID3D11Texture2D> = None;
+            device.CreateTexture2D(&staging_desc, None, Some(&mut staging))?;
+            let staging = staging.context("no se pudo crear la textura staging")?;
+
             Ok(Self {
                 device,
                 context,
                 duplication,
+                staging,
                 width,
                 height,
             })
@@ -91,33 +122,11 @@ impl ScreenCapturer {
             let resource = resource.context("resource nulo en AcquireNextFrame")?;
             let texture: ID3D11Texture2D = resource.cast()?;
 
-            // Textura "staging": copia en la que la CPU si puede leer
-            // (la textura original vive solo en GPU).
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: self.width,
-                Height: self.height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
-
-            let mut staging: Option<ID3D11Texture2D> = None;
-            self.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
-            let staging = staging.context("no se pudo crear la textura staging")?;
-
-            self.context.CopyResource(&staging, &texture);
+            self.context.CopyResource(&self.staging, &texture);
 
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
-                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .Map(&self.staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
                 .context("Map de la textura staging fallo")?;
 
             // El row pitch de la GPU puede tener padding extra, hay que
@@ -133,7 +142,7 @@ impl ScreenCapturer {
                 std::ptr::copy_nonoverlapping(src_row, dst_row, row_bytes);
             }
 
-            self.context.Unmap(&staging, 0);
+            self.context.Unmap(&self.staging, 0);
             self.duplication.ReleaseFrame().ok();
 
             Ok(Frame {

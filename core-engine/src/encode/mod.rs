@@ -11,8 +11,7 @@
 
 use crate::capture::Frame;
 use anyhow::{Context, Result};
-use image::codecs::jpeg::JpegEncoder;
-use image::ColorType;
+use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 
 pub struct VideoEncoder {
     /// Calidad JPEG, 1 (peor/mas chico) a 100 (mejor/mas pesado).
@@ -37,9 +36,9 @@ impl VideoEncoder {
         }
 
         let mut out = Vec::new();
-        let mut encoder = JpegEncoder::new_with_quality(&mut out, self.quality);
+        let encoder = JpegEncoder::new(&mut out, self.quality);
         encoder
-            .encode(&rgb, frame.width, frame.height, ColorType::Rgb8)
+            .encode(&rgb, frame.width as u16, frame.height as u16, JpegColorType::Rgb)
             .context("fallo al codificar el frame a JPEG")?;
         Ok(out)
     }
