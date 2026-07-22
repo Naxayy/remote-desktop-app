@@ -6,12 +6,19 @@ description = "Coordina el handshake inicial entre controller y agent (IDs, clav
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "=0.20.1"
+futures-util = "0.3"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+uuid = { version = "=1.10.0", features = ["v4"] }
+rand = "=0.8.5"
 
-# --- Se suman en los proximos pasos ---
-# axum / tungstenite   # servidor websocket para el handshake
+# Pines para evitar que cargo (viejo, 1.75, del entorno de pruebas)
+# se tope con crates que ya requieren la feature edition2024. Esto es
+# especifico de este sandbox de desarrollo - en tu maquina con rustup
+# al dia probablemente ni haga falta, pero no molesta dejarlo.
+idna_adapter = "=1.0.0"
