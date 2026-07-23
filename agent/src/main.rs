@@ -94,10 +94,15 @@ fn spawn_capture_thread(
     });
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+#[cfg(windows)]
+mod service;
 
+/// Logica real del agent: conectarse al signaling server, registrarse,
+/// y una vez emparejado, mandar video + recibir input. Es una funcion
+/// aparte (en vez de estar directo en `main`) porque tanto el modo
+/// consola como el modo servicio de Windows necesitan poder llamarla,
+/// cada uno armando su propio runtime de tokio.
+pub async fn run_agent() -> Result<()> {
     let signaling_url =
         std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string());
     let code = std::env::var("AGENT_CODE").unwrap_or_else(|_| "123456".to_string());
@@ -200,4 +205,49 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Corre el agent en modo consola: arma su propio runtime de tokio y
+/// bloquea hasta que `run_agent` termine. Es el modo que usamos para
+/// desarrollo/testing (`cargo run --bin agent`), y tambien el
+/// fallback si el binario se ejecuta sin ser lanzado por el Service
+/// Control Manager.
+fn run_console_mode() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let runtime = tokio::runtime::Runtime::new().context("no se pudo crear el runtime de tokio")?;
+    runtime.block_on(run_agent())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let command = args.get(1).map(|s| s.as_str());
+
+    #[cfg(windows)]
+    {
+        match command {
+            Some("install") => return service::install(),
+            Some("uninstall") => return service::uninstall(),
+            Some("console") => return run_console_mode(),
+            _ => {
+                // Sin argumentos: si el SCM nos esta lanzando como
+                // servicio, esto atiende ese arranque y no vuelve
+                // hasta que el servicio para. Si NO nos lanzo el SCM
+                // (ej: doble click en el exe), start_dispatcher falla
+                // enseguida y caemos al modo consola.
+                if service::start_dispatcher().is_ok() {
+                    return Ok(());
+                }
+                tracing::warn!(
+                    "no se pudo arrancar como servicio (¿no te lanzo el SCM?), corriendo en modo consola"
+                );
+                return run_console_mode();
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = command; // install/uninstall/service no aplican fuera de Windows
+        run_console_mode()
+    }
 }
