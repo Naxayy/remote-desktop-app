@@ -19,6 +19,22 @@ impl InputInjector {
     pub fn new() -> Self {
         Self
     }
+
+    pub fn move_mouse_normalized(&self, _nx: f64, _ny: f64) -> anyhow::Result<()> {
+        anyhow::bail!("input remoto solo esta implementado para Windows por ahora")
+    }
+
+    pub fn mouse_button(&self, _button: MouseButton, _pressed: bool) -> anyhow::Result<()> {
+        anyhow::bail!("input remoto solo esta implementado para Windows por ahora")
+    }
+
+    pub fn mouse_wheel(&self, _delta: i32) -> anyhow::Result<()> {
+        anyhow::bail!("input remoto solo esta implementado para Windows por ahora")
+    }
+
+    pub fn key(&self, _vk_code: u16, _pressed: bool) -> anyhow::Result<()> {
+        anyhow::bail!("input remoto solo esta implementado para Windows por ahora")
+    }
 }
 
 /// Boton de mouse para eventos de click.

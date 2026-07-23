@@ -47,6 +47,17 @@ impl InputInjector {
         send(&[input])
     }
 
+    /// Mueve el mouse usando coordenadas normalizadas 0.0-1.0 (0,0 =
+    /// esquina superior izquierda, 1,1 = esquina inferior derecha).
+    /// Pensado para el controller, que no conoce la resolucion real
+    /// de la pantalla remota - solo sabe donde esta el mouse dentro
+    /// de la ventana que esta mostrando el video.
+    pub fn move_mouse_normalized(&self, nx: f64, ny: f64) -> Result<()> {
+        let x = (nx.clamp(0.0, 1.0) * self.screen_width as f64) as i32;
+        let y = (ny.clamp(0.0, 1.0) * self.screen_height as f64) as i32;
+        self.move_mouse_absolute(x, y)
+    }
+
     pub fn mouse_button(&self, button: MouseButton, pressed: bool) -> Result<()> {
         let flag = match (button, pressed) {
             (MouseButton::Left, true) => MOUSEEVENTF_LEFTDOWN,

@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use core_engine::capture::ScreenCapturer;
 use core_engine::encode::VideoEncoder;
+use core_engine::input::{InputInjector, MouseButton};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +29,44 @@ use tokio_tungstenite::tungstenite::Message;
 /// Calidad JPEG de partida. Mas adelante esto deberia ajustarse en
 /// vivo segun el ancho de banda disponible.
 const QUALITY: u8 = 50;
+
+fn handle_input_event(injector: &InputInjector, payload: &Value) {
+    if payload["kind"] != "input" {
+        return;
+    }
+    let event = &payload["event"];
+    let result = match event["type"].as_str() {
+        Some("mouse_move") => {
+            let (nx, ny) = (
+                event["x"].as_f64().unwrap_or(0.0),
+                event["y"].as_f64().unwrap_or(0.0),
+            );
+            injector.move_mouse_normalized(nx, ny)
+        }
+        Some("mouse_button") => {
+            let pressed = event["pressed"].as_bool().unwrap_or(false);
+            let button = match event["button"].as_str() {
+                Some("right") => MouseButton::Right,
+                Some("middle") => MouseButton::Middle,
+                _ => MouseButton::Left,
+            };
+            injector.mouse_button(button, pressed)
+        }
+        Some("mouse_wheel") => {
+            let delta = event["delta"].as_i64().unwrap_or(0) as i32;
+            injector.mouse_wheel(delta)
+        }
+        Some("key") => {
+            let vk = event["vk"].as_u64().unwrap_or(0) as u16;
+            let pressed = event["pressed"].as_bool().unwrap_or(false);
+            injector.key(vk, pressed)
+        }
+        _ => Ok(()),
+    };
+    if let Err(e) = result {
+        tracing::warn!("no se pudo inyectar el evento de input: {e:#}");
+    }
+}
 
 fn spawn_capture_thread(
     latest: Arc<Mutex<Option<Vec<u8>>>>,
@@ -89,6 +128,8 @@ async fn main() -> Result<()> {
     let paired = Arc::new(AtomicBool::new(false));
 
     spawn_capture_thread(Arc::clone(&latest), Arc::clone(&frame_id), Arc::clone(&paired));
+
+    let input_injector = InputInjector::new();
 
     // Tarea que manda por la red el ultimo frame disponible. No manda
     // mas rapido de lo que hay frames nuevos (chequea cada 5ms, que da
@@ -152,7 +193,7 @@ async fn main() -> Result<()> {
                 tracing::warn!("error del signaling server: {}", parsed["message"]);
             }
             Some("relay") => {
-                tracing::debug!("relay recibido del controller (input, sin implementar todavia)");
+                handle_input_event(&input_injector, &parsed["payload"]);
             }
             _ => {}
         }
