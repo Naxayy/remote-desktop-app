@@ -7,7 +7,7 @@ description = "Agente que corre en la PC remota: servicio de Windows + engine + 
 [dependencies]
 core_engine = { path = "../core-engine" }
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "=0.20.1"
+tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 thiserror = "1"
 anyhow = "1"
