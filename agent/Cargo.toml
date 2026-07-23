@@ -7,10 +7,24 @@ description = "Agente que corre en la PC remota: servicio de Windows + engine + 
 [dependencies]
 core_engine = { path = "../core-engine" }
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "=0.20.1"
+futures-util = "0.3"
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Mismo pin que en signaling-server: evita que este sandbox (cargo 1.75)
+# se tope con crates que ya requieren edition2024. Probablemente no haga
+# falta en tu maquina con rustup al dia.
+idna_adapter = "=1.0.0"
+
+# minifb (ventana del dev_viewer) solo hace falta en Windows.
+[target.'cfg(windows)'.dev-dependencies]
+minifb = "0.27"
 
 # --- Se suman en los proximos pasos ---
-# windows-service = "0.6"   # registrar/manejar el agente como servicio de Windows
+# windows-service = "0.6"   # registrar/manejar el agent como servicio de Windows
