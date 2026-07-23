@@ -64,9 +64,9 @@ docker compose up --build
 ## Roadmap
 
 - [x] Esqueleto del workspace (Rust + Tauri)
-- [ ] Captura de pantalla en Windows (DXGI)
-- [ ] Codificacion/streaming de video
-- [ ] Signaling server (handshake + auth por codigo)
+- [x] Captura de pantalla en Windows (DXGI)
+- [x] Codificacion/streaming de video
+- [x] Signaling server (handshake + auth por codigo)
 - [ ] Conexion P2P con fallback a relay
 - [ ] Inyeccion de input remoto
 - [ ] Transferencia de archivos
