@@ -14,3 +14,4 @@ pub mod encode;
 pub mod input;
 pub mod net;
 pub mod crypto;
+pub mod netproto;

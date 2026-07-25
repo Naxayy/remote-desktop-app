@@ -1,6 +1,5 @@
-//! Simula un controller: se conecta al signaling server, pide
-//! conectarse al agent con codigo 123456, y manda un mensaje de
-//! prueba una vez emparejado.
+//! Simula un controller: se conecta al codigo 123456, y al emparejarse
+//! manda un mensaje BINARIO de prueba.
 //!
 //! Correr con (con test_agent ya corriendo en otra terminal):
 //!   cargo run --example test_controller -p signaling_server
@@ -20,19 +19,22 @@ async fn main() -> anyhow::Result<()> {
     println!("[controller] pidiendo conexion al codigo 123456...");
 
     while let Some(msg) = read.next().await {
-        let Message::Text(text) = msg? else { continue };
-        println!("[controller] recibido: {text}");
-
-        let parsed: serde_json::Value = serde_json::from_str(&text)?;
-        if parsed["type"] == "paired" {
-            println!("[controller] emparejado! mandando mensaje de prueba...");
-            let hello = json!({"type": "relay", "payload": {"from": "controller", "text": "hola agent, soy el controller"}});
-            write.send(Message::Text(hello.to_string())).await?;
-        }
-        if parsed["type"] == "relay" {
-            println!("[controller] respuesta del agent: {:?}", parsed["payload"]);
-            println!("[controller] round-trip completo, listo.");
-            break;
+        match msg? {
+            Message::Text(text) => {
+                println!("[controller] control recibido: {text}");
+                let parsed: serde_json::Value = serde_json::from_str(&text)?;
+                if parsed["type"] == "paired" {
+                    println!("[controller] emparejado! mandando bytes binarios de prueba...");
+                    let hello = b"hola agent, soy el controller (binario)".to_vec();
+                    write.send(Message::Binary(hello)).await?;
+                }
+            }
+            Message::Binary(bytes) => {
+                println!("[controller] binario recibido ({} bytes): {:?}", bytes.len(), bytes);
+                println!("[controller] round-trip binario completo, listo.");
+                break;
+            }
+            _ => {}
         }
     }
 

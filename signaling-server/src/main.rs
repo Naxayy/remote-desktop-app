@@ -84,70 +84,71 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>) -> Result<()
             Err(_) => break,
         };
 
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-
-        match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::RegisterAgent { code }) => {
-                let code = code.unwrap_or_else(generate_code);
-                state
-                    .pending_agents
-                    .lock()
-                    .unwrap()
-                    .insert(code.clone(), conn_id);
-                registered_code = Some(code.clone());
-                tracing::info!("agent {conn_id} registrado con codigo {code}");
-                send_to(&state, conn_id, ServerMessage::Registered { code });
-            }
-
-            Ok(ClientMessage::Connect { code }) => {
-                let agent_id = state.pending_agents.lock().unwrap().remove(&code);
-                match agent_id {
-                    Some(agent_id) => {
-                        state.pairs.lock().unwrap().insert(conn_id, agent_id);
-                        state.pairs.lock().unwrap().insert(agent_id, conn_id);
-                        tracing::info!("emparejados: controller {conn_id} <-> agent {agent_id}");
-                        send_to(&state, conn_id, ServerMessage::Paired);
-                        send_to(&state, agent_id, ServerMessage::Paired);
+        match msg {
+            Message::Text(text) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::RegisterAgent { code }) => {
+                        let code = code.unwrap_or_else(generate_code);
+                        state
+                            .pending_agents
+                            .lock()
+                            .unwrap()
+                            .insert(code.clone(), conn_id);
+                        registered_code = Some(code.clone());
+                        tracing::info!("agent {conn_id} registrado con codigo {code}");
+                        send_to(&state, conn_id, ServerMessage::Registered { code });
                     }
-                    None => {
+
+                    Ok(ClientMessage::Connect { code }) => {
+                        let agent_id = state.pending_agents.lock().unwrap().remove(&code);
+                        match agent_id {
+                            Some(agent_id) => {
+                                state.pairs.lock().unwrap().insert(conn_id, agent_id);
+                                state.pairs.lock().unwrap().insert(agent_id, conn_id);
+                                tracing::info!(
+                                    "emparejados: controller {conn_id} <-> agent {agent_id}"
+                                );
+                                send_to(&state, conn_id, ServerMessage::Paired);
+                                send_to(&state, agent_id, ServerMessage::Paired);
+                            }
+                            None => {
+                                send_to(
+                                    &state,
+                                    conn_id,
+                                    ServerMessage::Error {
+                                        message: format!("codigo '{code}' no encontrado"),
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    Err(e) => {
                         send_to(
                             &state,
                             conn_id,
                             ServerMessage::Error {
-                                message: format!("codigo '{code}' no encontrado"),
+                                message: format!("mensaje invalido: {e}"),
                             },
                         );
                     }
                 }
             }
 
-            Ok(ClientMessage::Relay { payload }) => {
+            // Video/input ya emparejados: reenvio binario directo, sin
+            // interpretar el contenido - el servidor no necesita saber
+            // si es un frame o un evento de input.
+            Message::Binary(bytes) => {
                 let peer = state.pairs.lock().unwrap().get(&conn_id).copied();
-                match peer {
-                    Some(peer_id) => send_to(&state, peer_id, ServerMessage::Relay { payload }),
-                    None => send_to(
-                        &state,
-                        conn_id,
-                        ServerMessage::Error {
-                            message: "todavia no estas emparejado con nadie".into(),
-                        },
-                    ),
+                if let Some(peer_id) = peer {
+                    if let Some(sender) = state.connections.lock().unwrap().get(&peer_id) {
+                        let _ = sender.send(Message::Binary(bytes));
+                    }
                 }
             }
 
-            Err(e) => {
-                send_to(
-                    &state,
-                    conn_id,
-                    ServerMessage::Error {
-                        message: format!("mensaje invalido: {e}"),
-                    },
-                );
-            }
+            Message::Close(_) => break,
+            _ => {}
         }
     }
 

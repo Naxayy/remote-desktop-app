@@ -1,5 +1,13 @@
-//! Protocolo de mensajes entre agent/controller y el signaling server.
-//! Se serializa como JSON sobre WebSocket.
+//! Protocolo de mensajes de CONTROL entre agent/controller y el
+//! signaling server (registro, emparejamiento, errores). Se serializa
+//! como JSON sobre WebSocket - son mensajes poco frecuentes, la
+//! legibilidad importa mas que el tamaño.
+//!
+//! Los mensajes de APLICACION (frames de video, eventos de input) ya
+//! NO pasan por aca: una vez emparejados, agent y controller mandan
+//! WebSocket binary frames que el servidor reenvia tal cual a la otra
+//! punta sin interpretarlos (ver netproto en core-engine para el
+//! formato de esos bytes).
 
 use serde::{Deserialize, Serialize};
 
@@ -16,12 +24,6 @@ pub enum ClientMessage {
 
     /// El controller pide conectarse al agent que tiene ese codigo.
     Connect { code: String },
-
-    /// Una vez emparejados, cualquier mensaje de aplicacion (futuro:
-    /// oferta/respuesta SDP, candidatos ICE, o mientras no tengamos
-    /// P2P real, los frames de video/input directamente) se manda
-    /// asi y el servidor lo reenvia tal cual a la otra punta.
-    Relay { payload: serde_json::Value },
 }
 
 /// Mensajes que el servidor le manda de vuelta a un cliente.
@@ -33,14 +35,13 @@ pub enum ServerMessage {
     Registered { code: String },
 
     /// Le avisa al agent que un controller se quiere conectar, y al
-    /// controller que la conexion se establecio.
+    /// controller que la conexion se establecio. A partir de este
+    /// mensaje, ambas puntas pueden empezar a mandarse WebSocket
+    /// binary frames que el servidor va a reenviar automaticamente.
     Paired,
 
     /// La otra punta se desconecto - la sesion ya no es valida.
     PeerDisconnected,
-
-    /// Reenvio de un mensaje de aplicacion desde la otra punta.
-    Relay { payload: serde_json::Value },
 
     /// Algo salio mal (codigo no encontrado, ya emparejado, etc).
     Error { message: String },

@@ -1,8 +1,15 @@
 //! Visor de desarrollo: hace de "controller" temporal mientras no
 //! tenemos la UI real de Tauri lista. Se conecta al signaling server,
 //! pide el codigo del agent, muestra los frames que le van llegando, y
-//! ahora tambien manda el mouse/teclado de esta ventana como input
-//! remoto para que el agent lo inyecte.
+//! manda el mouse/teclado de esta ventana como input remoto.
+//!
+//! Tambien soporta pedir un reinicio remoto (escribi "restart" + Enter
+//! en esta consola) y se reconecta solo si la conexion se corta - por
+//! ejemplo, justo lo que pasa cuando la PC remota se reinicia: el
+//! agent (como servicio de Windows, AutoStart) vuelve a registrarse
+//! con el mismo codigo apenas Windows termina de arrancar, y este
+//! visor reintenta conectarse cada pocos segundos hasta encontrarlo
+//! de nuevo.
 //!
 //! Este archivo es una herramienta de prueba, no el controller final -
 //! cuando controller-ui (Tauri) este listo, esta logica de red se
@@ -54,25 +61,24 @@ fn key_to_vk(key: minifb::Key) -> Option<u16> {
 }
 
 #[cfg(windows)]
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+async fn run_session(
+    signaling_url: &str,
+    code: &str,
+    restart_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
     use core_engine::encode::VideoDecoder;
+    use core_engine::netproto::{self, ControlEvent, InputEvent};
     use futures_util::{SinkExt, StreamExt};
     use minifb::{Key, MouseButton as MinifbMouseButton, MouseMode, Window, WindowOptions};
     use serde_json::{json, Value};
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message;
 
-    let signaling_url =
-        std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string());
-    let code = std::env::var("AGENT_CODE").unwrap_or_else(|_| "123456".to_string());
-
-    println!("conectando a {signaling_url}...");
-    let (ws_stream, _) = connect_async(&signaling_url).await?;
+    let (ws_stream, _) = connect_async(signaling_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -90,29 +96,48 @@ async fn main() -> anyhow::Result<()> {
     println!("pidiendo conexion al codigo {code}...");
 
     let latest_jpeg: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let session_alive = Arc::new(AtomicBool::new(true));
 
     {
         let latest_jpeg = Arc::clone(&latest_jpeg);
+        let session_alive = Arc::clone(&session_alive);
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
-                let Ok(Message::Text(text)) = msg else { continue };
-                let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
-                match parsed["type"].as_str() {
-                    Some("paired") => println!("emparejado con el agent, esperando video..."),
-                    Some("relay") => {
-                        if parsed["payload"]["kind"] == "frame" {
-                            if let Some(b64) = parsed["payload"]["data"].as_str() {
-                                if let Ok(bytes) = STANDARD.decode(b64) {
-                                    *latest_jpeg.lock().unwrap() = Some(bytes);
-                                }
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let Ok(parsed) = serde_json::from_str::<Value>(&text) else { continue };
+                        match parsed["type"].as_str() {
+                            Some("paired") => println!("emparejado con el agent, esperando video..."),
+                            Some("error") => eprintln!("error del servidor: {}", parsed["message"]),
+                            Some("peer_disconnected") => {
+                                println!("el agent se desconecto");
+                                session_alive.store(false, Ordering::Relaxed);
+                                break;
                             }
+                            _ => {}
                         }
                     }
-                    Some("error") => eprintln!("error del servidor: {}", parsed["message"]),
-                    Some("peer_disconnected") => println!("el agent se desconecto"),
+                    Ok(Message::Binary(bytes)) => match netproto::peek_kind(&bytes) {
+                        Some(netproto::KIND_FRAME) => {
+                            if let Some(jpeg) = netproto::decode_frame(&bytes) {
+                                *latest_jpeg.lock().unwrap() = Some(jpeg.to_vec());
+                            }
+                        }
+                        Some(netproto::KIND_CONTROL) => {
+                            if let Some(ControlEvent::RestartAck) = netproto::decode_control(&bytes) {
+                                println!("el agent confirmo el reinicio, va a desconectarse...");
+                            }
+                        }
+                        _ => {}
+                    },
+                    Ok(Message::Close(_)) | Err(_) => {
+                        session_alive.store(false, Ordering::Relaxed);
+                        break;
+                    }
                     _ => {}
                 }
             }
+            session_alive.store(false, Ordering::Relaxed);
         });
     }
 
@@ -122,13 +147,17 @@ async fn main() -> anyhow::Result<()> {
     let mut frames_shown = 0u64;
     let mut last_report = std::time::Instant::now();
 
-    // Estado previo de input, para mandar solo los CAMBIOS (evita
-    // saturar la red mandando "sigue apretado" 200 veces por segundo).
     let mut prev_mouse_pos: Option<(f32, f32)> = None;
-    let mut prev_buttons = [false, false, false]; // left, right, middle
+    let mut prev_buttons = [false, false, false];
     let mut prev_keys: HashSet<Key> = HashSet::new();
 
-    loop {
+    while session_alive.load(Ordering::Relaxed) {
+        if restart_requested.swap(false, Ordering::Relaxed) {
+            println!("mandando pedido de reinicio remoto...");
+            let msg = netproto::encode_control(ControlEvent::RestartRequest { delay_secs: 5 });
+            let _ = out_tx.send(Message::Binary(msg));
+        }
+
         let jpeg = { latest_jpeg.lock().unwrap().take() };
         if let Some(jpeg) = jpeg {
             match VideoDecoder::decode(&jpeg) {
@@ -159,16 +188,16 @@ async fn main() -> anyhow::Result<()> {
             win.update();
         }
 
-        // --- Capturar y mandar input de esta ventana ---
         if let Some(win) = &window {
-            if current_size.0 > 0 && current_size.1 > 0 {
+            let (win_w, win_h) = win.get_size();
+            if current_size.0 > 0 && current_size.1 > 0 && win_w > 0 && win_h > 0 {
                 if let Some((mx, my)) = win.get_mouse_pos(MouseMode::Clamp) {
-                    let nx = (mx / current_size.0 as f32) as f64;
-                    let ny = (my / current_size.1 as f32) as f64;
+                    let nx = mx / current_size.0 as f32;
+                    let ny = my / current_size.1 as f32;
                     if prev_mouse_pos != Some((mx, my)) {
                         prev_mouse_pos = Some((mx, my));
-                        let msg = json!({"type": "relay", "payload": {"kind": "input", "event": {"type": "mouse_move", "x": nx, "y": ny}}});
-                        let _ = out_tx.send(Message::Text(msg.to_string()));
+                        let msg = netproto::encode_input(InputEvent::MouseMove { x: nx, y: ny });
+                        let _ = out_tx.send(Message::Binary(msg));
                     }
                 }
 
@@ -177,11 +206,13 @@ async fn main() -> anyhow::Result<()> {
                     win.get_mouse_down(MinifbMouseButton::Right),
                     win.get_mouse_down(MinifbMouseButton::Middle),
                 ];
-                let names = ["left", "right", "middle"];
                 for i in 0..3 {
                     if buttons[i] != prev_buttons[i] {
-                        let msg = json!({"type": "relay", "payload": {"kind": "input", "event": {"type": "mouse_button", "button": names[i], "pressed": buttons[i]}}});
-                        let _ = out_tx.send(Message::Text(msg.to_string()));
+                        let msg = netproto::encode_input(InputEvent::MouseButton {
+                            button: i as u8,
+                            pressed: buttons[i],
+                        });
+                        let _ = out_tx.send(Message::Binary(msg));
                     }
                 }
                 prev_buttons = buttons;
@@ -190,21 +221,23 @@ async fn main() -> anyhow::Result<()> {
             let current_keys: HashSet<Key> = win.get_keys().into_iter().collect();
             for key in current_keys.difference(&prev_keys) {
                 if let Some(vk) = key_to_vk(*key) {
-                    let msg = json!({"type": "relay", "payload": {"kind": "input", "event": {"type": "key", "vk": vk, "pressed": true}}});
-                    let _ = out_tx.send(Message::Text(msg.to_string()));
+                    let msg = netproto::encode_input(InputEvent::Key { vk, pressed: true });
+                    let _ = out_tx.send(Message::Binary(msg));
                 }
             }
             for key in prev_keys.difference(&current_keys) {
                 if let Some(vk) = key_to_vk(*key) {
-                    let msg = json!({"type": "relay", "payload": {"kind": "input", "event": {"type": "key", "vk": vk, "pressed": false}}});
-                    let _ = out_tx.send(Message::Text(msg.to_string()));
+                    let msg = netproto::encode_input(InputEvent::Key { vk, pressed: false });
+                    let _ = out_tx.send(Message::Binary(msg));
                 }
             }
             prev_keys = current_keys;
         }
 
         if last_report.elapsed().as_secs_f64() >= 1.0 {
-            println!("{} fps recibidos", frames_shown);
+            if frames_shown > 0 {
+                println!("{} fps recibidos", frames_shown);
+            }
             frames_shown = 0;
             last_report = std::time::Instant::now();
         }
@@ -218,6 +251,45 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let signaling_url =
+        std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string());
+    let code = std::env::var("AGENT_CODE").unwrap_or_else(|_| "123456".to_string());
+
+    let restart_requested = Arc::new(AtomicBool::new(false));
+
+    // Consola: escribi "restart" + Enter en cualquier momento para
+    // pedir el reinicio remoto de la PC del agent.
+    {
+        let restart_requested = Arc::clone(&restart_requested);
+        tokio::spawn(async move {
+            println!("(escribi 'restart' + Enter en cualquier momento para reiniciar la PC remota)");
+            let mut lines = BufReader::new(tokio::io::stdin()).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.trim().eq_ignore_ascii_case("restart") {
+                    restart_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+    }
+
+    loop {
+        println!("conectando a {signaling_url}...");
+        match run_session(&signaling_url, &code, Arc::clone(&restart_requested)).await {
+            Ok(()) => println!("sesion terminada."),
+            Err(e) => eprintln!("error de conexion: {e:#}"),
+        }
+        println!("reintentando en 3s...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 #[cfg(not(windows))]

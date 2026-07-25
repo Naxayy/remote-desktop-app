@@ -12,10 +12,10 @@
 //! servicio de Windows, y migrar de relay-por-signaling a P2P real.
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use core_engine::capture::ScreenCapturer;
 use core_engine::encode::VideoEncoder;
 use core_engine::input::{InputInjector, MouseButton};
+use core_engine::netproto::{self, ControlEvent, InputEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,41 +30,59 @@ use tokio_tungstenite::tungstenite::Message;
 /// vivo segun el ancho de banda disponible.
 const QUALITY: u8 = 50;
 
-fn handle_input_event(injector: &InputInjector, payload: &Value) {
-    if payload["kind"] != "input" {
+fn handle_input_bytes(injector: &InputInjector, data: &[u8]) {
+    let Some(event) = netproto::decode_input(data) else {
         return;
-    }
-    let event = &payload["event"];
-    let result = match event["type"].as_str() {
-        Some("mouse_move") => {
-            let (nx, ny) = (
-                event["x"].as_f64().unwrap_or(0.0),
-                event["y"].as_f64().unwrap_or(0.0),
-            );
-            injector.move_mouse_normalized(nx, ny)
-        }
-        Some("mouse_button") => {
-            let pressed = event["pressed"].as_bool().unwrap_or(false);
-            let button = match event["button"].as_str() {
-                Some("right") => MouseButton::Right,
-                Some("middle") => MouseButton::Middle,
+    };
+    let result = match event {
+        InputEvent::MouseMove { x, y } => injector.move_mouse_normalized(x as f64, y as f64),
+        InputEvent::MouseButton { button, pressed } => {
+            let button = match button {
+                1 => MouseButton::Right,
+                2 => MouseButton::Middle,
                 _ => MouseButton::Left,
             };
             injector.mouse_button(button, pressed)
         }
-        Some("mouse_wheel") => {
-            let delta = event["delta"].as_i64().unwrap_or(0) as i32;
-            injector.mouse_wheel(delta)
-        }
-        Some("key") => {
-            let vk = event["vk"].as_u64().unwrap_or(0) as u16;
-            let pressed = event["pressed"].as_bool().unwrap_or(false);
-            injector.key(vk, pressed)
-        }
-        _ => Ok(()),
+        InputEvent::MouseWheel { delta } => injector.mouse_wheel(delta),
+        InputEvent::Key { vk, pressed } => injector.key(vk, pressed),
     };
     if let Err(e) = result {
         tracing::warn!("no se pudo inyectar el evento de input: {e:#}");
+    }
+}
+
+/// Ejecuta un reinicio real de Windows via el comando `shutdown`, con
+/// el margen que pidio el controller. Usamos el comando del sistema
+/// en vez de una API directa porque ya se encarga de avisarle a las
+/// demas apps abiertas y de dar el margen configurado.
+#[cfg(windows)]
+fn trigger_restart(delay_secs: u8) {
+    tracing::warn!("reinicio remoto pedido - ejecutando en {delay_secs}s");
+    let result = std::process::Command::new("shutdown")
+        .args(["/r", "/t", &delay_secs.to_string()])
+        .status();
+    if let Err(e) = result {
+        tracing::error!("no se pudo ejecutar el comando de reinicio: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn trigger_restart(_delay_secs: u8) {
+    tracing::warn!("reinicio remoto pedido, pero no esta implementado fuera de Windows");
+}
+
+fn handle_control_bytes(out_tx: &mpsc::UnboundedSender<Message>, data: &[u8]) {
+    match netproto::decode_control(data) {
+        Some(ControlEvent::RestartRequest { delay_secs }) => {
+            trigger_restart(delay_secs);
+            let ack = netproto::encode_control(ControlEvent::RestartAck);
+            let _ = out_tx.send(Message::Binary(ack));
+        }
+        Some(ControlEvent::RestartAck) => {
+            // El agent no espera recibir esto, es el agent el que lo manda.
+        }
+        None => {}
     }
 }
 
@@ -74,22 +92,29 @@ fn spawn_capture_thread(
     paired: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let run = || -> Result<()> {
-            let mut capturer = ScreenCapturer::new()?;
-            let encoder = VideoEncoder::new(QUALITY);
-            loop {
-                if !paired.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(100));
-                    continue;
+        // DXGI Desktop Duplication puede fallar en varias situaciones
+        // normales: la pantalla se bloquea, entra en suspension, o hay
+        // una sesion de Escritorio Remoto encima. En vez de morir del
+        // todo, reintentamos: recreamos el ScreenCapturer y seguimos.
+        loop {
+            let run = || -> Result<()> {
+                let mut capturer = ScreenCapturer::new()?;
+                let encoder = VideoEncoder::new(QUALITY);
+                loop {
+                    if !paired.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    let frame = capturer.next_frame()?;
+                    let compressed = encoder.encode(&frame)?;
+                    *latest.lock().unwrap() = Some(compressed);
+                    frame_id.fetch_add(1, Ordering::Relaxed);
                 }
-                let frame = capturer.next_frame()?;
-                let compressed = encoder.encode(&frame)?;
-                *latest.lock().unwrap() = Some(compressed);
-                frame_id.fetch_add(1, Ordering::Relaxed);
+            };
+            if let Err(e) = run() {
+                tracing::warn!("captura interrumpida ({e:#}), reintentando en 2s...");
+                thread::sleep(Duration::from_secs(2));
             }
-        };
-        if let Err(e) = run() {
-            tracing::error!("hilo de captura termino con error: {e:#}");
         }
     });
 }
@@ -158,16 +183,17 @@ pub async fn run_agent() -> Result<()> {
                 last_sent = current;
                 let frame = { latest.lock().unwrap().clone() };
                 if let Some(frame) = frame {
-                    let b64 = STANDARD.encode(&frame);
-                    let msg = json!({"type": "relay", "payload": {"kind": "frame", "data": b64}});
-                    let _ = out_tx.send(Message::Text(msg.to_string()));
+                    let msg = netproto::encode_frame(&frame);
+                    let _ = out_tx.send(Message::Binary(msg));
                 }
             }
         });
     }
 
-    // Loop principal: procesa los mensajes de control del signaling
-    // server (registro confirmado, emparejamiento, desconexion, etc).
+    // Loop principal: los mensajes de TEXTO son control del signaling
+    // server (registro confirmado, emparejamiento, etc), los de
+    // BINARIO son eventos de input que manda el controller una vez
+    // emparejados.
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -176,30 +202,37 @@ pub async fn run_agent() -> Result<()> {
                 break;
             }
         };
-        let Message::Text(text) = msg else { continue };
-        let parsed: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
 
-        match parsed["type"].as_str() {
-            Some("registered") => {
-                tracing::info!("registrado con codigo {}", parsed["code"]);
+        match msg {
+            Message::Text(text) => {
+                let parsed: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match parsed["type"].as_str() {
+                    Some("registered") => {
+                        tracing::info!("registrado con codigo {}", parsed["code"]);
+                    }
+                    Some("paired") => {
+                        tracing::info!("controller conectado - arrancando streaming");
+                        paired.store(true, Ordering::Relaxed);
+                    }
+                    Some("peer_disconnected") => {
+                        tracing::info!("controller desconectado - pausando streaming");
+                        paired.store(false, Ordering::Relaxed);
+                    }
+                    Some("error") => {
+                        tracing::warn!("error del signaling server: {}", parsed["message"]);
+                    }
+                    _ => {}
+                }
             }
-            Some("paired") => {
-                tracing::info!("controller conectado - arrancando streaming");
-                paired.store(true, Ordering::Relaxed);
-            }
-            Some("peer_disconnected") => {
-                tracing::info!("controller desconectado - pausando streaming");
-                paired.store(false, Ordering::Relaxed);
-            }
-            Some("error") => {
-                tracing::warn!("error del signaling server: {}", parsed["message"]);
-            }
-            Some("relay") => {
-                handle_input_event(&input_injector, &parsed["payload"]);
-            }
+            Message::Binary(bytes) => match netproto::peek_kind(&bytes) {
+                Some(netproto::KIND_INPUT) => handle_input_bytes(&input_injector, &bytes),
+                Some(netproto::KIND_CONTROL) => handle_control_bytes(&out_tx, &bytes),
+                _ => {}
+            },
+            Message::Close(_) => break,
             _ => {}
         }
     }

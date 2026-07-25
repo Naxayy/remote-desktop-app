@@ -1,6 +1,5 @@
-//! Simula un agent: se conecta al signaling server, se registra con
-//! un codigo fijo, y espera mensajes de relay (los imprime y
-//! responde con un eco).
+//! Simula un agent: se registra, y al emparejarse manda un mensaje
+//! BINARIO de prueba y espera la respuesta binaria del controller.
 //!
 //! Correr con:
 //!   cargo run --example test_agent -p signaling_server
@@ -20,17 +19,20 @@ async fn main() -> anyhow::Result<()> {
     println!("[agent] registrandome con codigo fijo 123456...");
 
     while let Some(msg) = read.next().await {
-        let Message::Text(text) = msg? else { continue };
-        println!("[agent] recibido: {text}");
-
-        let parsed: serde_json::Value = serde_json::from_str(&text)?;
-        if parsed["type"] == "paired" {
-            println!("[agent] emparejado con un controller!");
-        }
-        if parsed["type"] == "relay" {
-            println!("[agent] mensaje del controller: {:?}", parsed["payload"]);
-            let reply = json!({"type": "relay", "payload": {"from": "agent", "text": "hola controller, soy el agent"}});
-            write.send(Message::Text(reply.to_string())).await?;
+        match msg? {
+            Message::Text(text) => {
+                println!("[agent] control recibido: {text}");
+                let parsed: serde_json::Value = serde_json::from_str(&text)?;
+                if parsed["type"] == "paired" {
+                    println!("[agent] emparejado! esperando bytes binarios del controller...");
+                }
+            }
+            Message::Binary(bytes) => {
+                println!("[agent] binario recibido ({} bytes): {:?}", bytes.len(), bytes);
+                let reply = b"hola controller, soy el agent (binario)".to_vec();
+                write.send(Message::Binary(reply)).await?;
+            }
+            _ => {}
         }
     }
 
