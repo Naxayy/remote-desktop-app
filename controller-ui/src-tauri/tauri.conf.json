@@ -3,16 +3,19 @@
   "version": "0.1.0",
   "identifier": "com.nicolas.remotedesktopapp.controller",
   "build": {
-    "devUrl": "http://localhost:1420",
     "frontendDist": "../src"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Remote Desktop App - Controller",
-        "width": 1100,
-        "height": 720
+        "width": 1200,
+        "height": 800
       }
     ]
+  },
+  "bundle": {
+    "icon": ["icons/icon.ico", "icons/icon.png"]
   }
 }

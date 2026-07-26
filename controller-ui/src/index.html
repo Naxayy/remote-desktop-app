@@ -3,9 +3,42 @@
   <head>
     <meta charset="UTF-8" />
     <title>Remote Desktop App - Controller</title>
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <!-- Placeholder: proximo paso, UI real (lista de conexiones, input de codigo, viewer de video) -->
-    <h1>Controller UI - en construccion</h1>
+    <!-- Pantalla de conexion: se muestra hasta que estamos emparejados -->
+    <div id="connect-screen" class="screen">
+      <div class="connect-card">
+        <h1>Remote Desktop App</h1>
+        <p class="subtitle">Conectate a una PC remota</p>
+
+        <label>Servidor</label>
+        <input id="signaling-url" type="text" placeholder="wss://tu-dominio.com" />
+
+        <label>Código</label>
+        <input id="agent-code" type="text" placeholder="123456" maxlength="6" />
+
+        <button id="connect-btn">Conectar</button>
+        <p id="connect-status" class="status"></p>
+      </div>
+    </div>
+
+    <!-- Pantalla de sesion activa -->
+    <div id="session-screen" class="screen hidden">
+      <div id="toolbar">
+        <span id="session-status">Conectando...</span>
+        <div class="toolbar-actions">
+          <input id="file-path-input" type="text" placeholder="Ruta del archivo a enviar" />
+          <button id="send-file-btn">Enviar archivo</button>
+          <button id="restart-btn" class="danger">Reiniciar PC remota</button>
+          <button id="disconnect-btn">Desconectar</button>
+        </div>
+      </div>
+      <div id="video-container">
+        <img id="video" alt="Escritorio remoto" tabindex="0" />
+      </div>
+    </div>
+
+    <script src="app.js"></script>
   </body>
 </html>

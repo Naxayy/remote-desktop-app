@@ -61,10 +61,63 @@ fn key_to_vk(key: minifb::Key) -> Option<u16> {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone)]
+enum ConsoleCommand {
+    Restart,
+    SendFile(String),
+}
+
+#[cfg(windows)]
+async fn send_file(out_tx: &tokio::sync::mpsc::UnboundedSender<tokio_tungstenite::tungstenite::Message>, path: &str) {
+    use core_engine::netproto::{self, FileEvent};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let path = std::path::Path::new(path.trim());
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("no se pudo leer '{}': {e}", path.display());
+            return;
+        }
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "archivo".to_string());
+    let transfer_id: u32 = rand_transfer_id();
+    let total_size = data.len() as u64;
+
+    println!("mandando '{name}' ({total_size} bytes)...");
+    let offer = netproto::encode_file(FileEvent::Offer { transfer_id, name: &name, total_size });
+    let _ = out_tx.send(Message::Binary(offer));
+
+    for chunk in data.chunks(netproto::FILE_CHUNK_SIZE) {
+        let msg = netproto::encode_file(FileEvent::Chunk { transfer_id, data: chunk });
+        if out_tx.send(Message::Binary(msg)).is_err() {
+            return;
+        }
+    }
+
+    let complete = netproto::encode_file(FileEvent::Complete { transfer_id });
+    let _ = out_tx.send(Message::Binary(complete));
+    println!("'{name}' mandado completo.");
+}
+
+#[cfg(windows)]
+fn rand_transfer_id() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // No hace falta criptograficamente aleatorio, solo que no se
+    // repita entre transferencias concurrentes (que por ahora no
+    // soportamos de todos modos - una a la vez).
+    (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() % u32::MAX as u128) as u32
+}
+
+
+#[cfg(windows)]
 async fn run_session(
     signaling_url: &str,
     code: &str,
-    restart_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    commands_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ConsoleCommand>,
 ) -> anyhow::Result<()> {
     use core_engine::encode::VideoDecoder;
     use core_engine::netproto::{self, ControlEvent, InputEvent};
@@ -102,6 +155,23 @@ async fn run_session(
         let latest_jpeg = Arc::clone(&latest_jpeg);
         let session_alive = Arc::clone(&session_alive);
         tokio::spawn(async move {
+            use std::collections::HashMap;
+            use std::fs::File;
+            use std::io::Write;
+            use core_engine::netproto::OwnedFileEvent;
+
+            struct IncomingTransfer {
+                file: File,
+                path: std::path::PathBuf,
+            }
+            let mut incoming_transfers: HashMap<u32, IncomingTransfer> = HashMap::new();
+            let received_dir = std::env::var("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join("Downloads")
+                .join("RemoteDesktopApp-Received");
+            let _ = std::fs::create_dir_all(&received_dir);
+
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
@@ -128,6 +198,31 @@ async fn run_session(
                                 println!("el agent confirmo el reinicio, va a desconectarse...");
                             }
                         }
+                        Some(netproto::KIND_FILE) => match netproto::decode_file(&bytes) {
+                            Some(OwnedFileEvent::Offer { transfer_id, name, total_size }) => {
+                                let safe_name = std::path::Path::new(&name)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "archivo_recibido".to_string());
+                                let dest = received_dir.join(&safe_name);
+                                println!("recibiendo '{safe_name}' ({total_size} bytes)...");
+                                if let Ok(file) = File::create(&dest) {
+                                    incoming_transfers
+                                        .insert(transfer_id, IncomingTransfer { file, path: dest });
+                                }
+                            }
+                            Some(OwnedFileEvent::Chunk { transfer_id, data }) => {
+                                if let Some(t) = incoming_transfers.get_mut(&transfer_id) {
+                                    let _ = t.file.write_all(&data);
+                                }
+                            }
+                            Some(OwnedFileEvent::Complete { transfer_id }) => {
+                                if let Some(t) = incoming_transfers.remove(&transfer_id) {
+                                    println!("archivo recibido: {}", t.path.display());
+                                }
+                            }
+                            None => {}
+                        },
                         _ => {}
                     },
                     Ok(Message::Close(_)) | Err(_) => {
@@ -152,10 +247,17 @@ async fn run_session(
     let mut prev_keys: HashSet<Key> = HashSet::new();
 
     while session_alive.load(Ordering::Relaxed) {
-        if restart_requested.swap(false, Ordering::Relaxed) {
-            println!("mandando pedido de reinicio remoto...");
-            let msg = netproto::encode_control(ControlEvent::RestartRequest { delay_secs: 5 });
-            let _ = out_tx.send(Message::Binary(msg));
+        while let Ok(command) = commands_rx.try_recv() {
+            match command {
+                ConsoleCommand::Restart => {
+                    println!("mandando pedido de reinicio remoto...");
+                    let msg = netproto::encode_control(ControlEvent::RestartRequest { delay_secs: 5 });
+                    let _ = out_tx.send(Message::Binary(msg));
+                }
+                ConsoleCommand::SendFile(path) => {
+                    send_file(&out_tx, &path).await;
+                }
+            }
         }
 
         let jpeg = { latest_jpeg.lock().unwrap().take() };
@@ -256,34 +358,35 @@ async fn run_session(
 #[cfg(windows)]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     let signaling_url =
         std::env::var("SIGNALING_URL").unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string());
     let code = std::env::var("AGENT_CODE").unwrap_or_else(|_| "123456".to_string());
 
-    let restart_requested = Arc::new(AtomicBool::new(false));
+    let (commands_tx, mut commands_rx) = tokio::sync::mpsc::unbounded_channel::<ConsoleCommand>();
 
-    // Consola: escribi "restart" + Enter en cualquier momento para
-    // pedir el reinicio remoto de la PC del agent.
-    {
-        let restart_requested = Arc::clone(&restart_requested);
-        tokio::spawn(async move {
-            println!("(escribi 'restart' + Enter en cualquier momento para reiniciar la PC remota)");
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().eq_ignore_ascii_case("restart") {
-                    restart_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+    // Consola: comandos disponibles en cualquier momento:
+    //   restart          -> reinicia la PC remota
+    //   send <ruta>      -> manda un archivo a la PC remota
+    tokio::spawn(async move {
+        println!("comandos: 'restart' (reiniciar la PC remota), 'send <ruta>' (mandar un archivo)");
+        let mut lines = BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.eq_ignore_ascii_case("restart") {
+                let _ = commands_tx.send(ConsoleCommand::Restart);
+            } else if let Some(path) = line.strip_prefix("send ") {
+                let _ = commands_tx.send(ConsoleCommand::SendFile(path.to_string()));
+            } else if !line.is_empty() {
+                println!("comando no reconocido: '{line}'");
             }
-        });
-    }
+        }
+    });
 
     loop {
         println!("conectando a {signaling_url}...");
-        match run_session(&signaling_url, &code, Arc::clone(&restart_requested)).await {
+        match run_session(&signaling_url, &code, &mut commands_rx).await {
             Ok(()) => println!("sesion terminada."),
             Err(e) => eprintln!("error de conexion: {e:#}"),
         }

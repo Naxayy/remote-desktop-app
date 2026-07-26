@@ -5,6 +5,7 @@ members = [
     "agent",
     "signaling-server",
     "relay-server",
+    "controller-ui/src-tauri",
 ]
 
 # Perfil optimizado para binarios de producción: el agente y el controller

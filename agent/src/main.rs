@@ -15,9 +15,13 @@ use anyhow::{Context, Result};
 use core_engine::capture::ScreenCapturer;
 use core_engine::encode::VideoEncoder;
 use core_engine::input::{InputInjector, MouseButton};
-use core_engine::netproto::{self, ControlEvent, InputEvent};
+use core_engine::netproto::{self, ControlEvent, InputEvent, OwnedFileEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,6 +33,72 @@ use tokio_tungstenite::tungstenite::Message;
 /// Calidad JPEG de partida. Mas adelante esto deberia ajustarse en
 /// vivo segun el ancho de banda disponible.
 const QUALITY: u8 = 50;
+
+/// Transferencia de archivo entrante en progreso.
+struct IncomingTransfer {
+    file: File,
+    path: PathBuf,
+    received: u64,
+    total: u64,
+}
+
+/// Carpeta donde se guardan los archivos que llegan del controller.
+/// Fija (no depende del usuario logueado) porque el agent puede correr
+/// como servicio LocalSystem, sin un "Desktop" de usuario al que
+/// escribir directamente.
+fn received_files_dir() -> PathBuf {
+    let dir = PathBuf::from("C:\\ProgramData\\RemoteDesktopAppAgent\\received");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn handle_file_bytes(transfers: &mut HashMap<u32, IncomingTransfer>, data: &[u8]) {
+    match netproto::decode_file(data) {
+        Some(OwnedFileEvent::Offer { transfer_id, name, total_size }) => {
+            // Sanitizar: nos quedamos solo con el nombre de archivo,
+            // sin separadores de path, para que el controller no
+            // pueda escribir fuera de la carpeta de destino.
+            let safe_name = std::path::Path::new(&name)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "archivo_recibido".to_string());
+            let dest = received_files_dir().join(&safe_name);
+            match File::create(&dest) {
+                Ok(file) => {
+                    tracing::info!(
+                        "recibiendo archivo '{safe_name}' ({total_size} bytes) -> {}",
+                        dest.display()
+                    );
+                    transfers.insert(
+                        transfer_id,
+                        IncomingTransfer { file, path: dest, received: 0, total: total_size },
+                    );
+                }
+                Err(e) => tracing::error!("no se pudo crear el archivo de destino: {e}"),
+            }
+        }
+        Some(OwnedFileEvent::Chunk { transfer_id, data }) => {
+            if let Some(t) = transfers.get_mut(&transfer_id) {
+                if let Err(e) = t.file.write_all(&data) {
+                    tracing::error!("error escribiendo el archivo recibido: {e}");
+                    return;
+                }
+                t.received += data.len() as u64;
+            }
+        }
+        Some(OwnedFileEvent::Complete { transfer_id }) => {
+            if let Some(t) = transfers.remove(&transfer_id) {
+                tracing::info!(
+                    "archivo recibido completo: {} ({}/{} bytes)",
+                    t.path.display(),
+                    t.received,
+                    t.total
+                );
+            }
+        }
+        None => {}
+    }
+}
 
 fn handle_input_bytes(injector: &InputInjector, data: &[u8]) {
     let Some(event) = netproto::decode_input(data) else {
@@ -160,6 +230,7 @@ pub async fn run_agent() -> Result<()> {
     spawn_capture_thread(Arc::clone(&latest), Arc::clone(&frame_id), Arc::clone(&paired));
 
     let input_injector = InputInjector::new();
+    let mut incoming_transfers: HashMap<u32, IncomingTransfer> = HashMap::new();
 
     // Tarea que manda por la red el ultimo frame disponible. No manda
     // mas rapido de lo que hay frames nuevos (chequea cada 5ms, que da
@@ -230,6 +301,7 @@ pub async fn run_agent() -> Result<()> {
             Message::Binary(bytes) => match netproto::peek_kind(&bytes) {
                 Some(netproto::KIND_INPUT) => handle_input_bytes(&input_injector, &bytes),
                 Some(netproto::KIND_CONTROL) => handle_control_bytes(&out_tx, &bytes),
+                Some(netproto::KIND_FILE) => handle_file_bytes(&mut incoming_transfers, &bytes),
                 _ => {}
             },
             Message::Close(_) => break,

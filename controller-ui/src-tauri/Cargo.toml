@@ -10,6 +10,13 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 core_engine = { path = "../../core-engine" }
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+base64 = "0.22"
+
+# Mismo pin que en agent/signaling-server: evita que este sandbox
+# (cargo 1.75) se tope con crates que ya requieren edition2024.
+idna_adapter = "=1.0.0"
