@@ -16,6 +16,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
+#[derive(Clone, Copy)]
 pub struct InputInjector {
     screen_width: i32,
     screen_height: i32,

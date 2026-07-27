@@ -12,6 +12,7 @@ mod windows_impl;
 pub use windows_impl::InputInjector;
 
 #[cfg(not(windows))]
+#[derive(Clone, Copy)]
 pub struct InputInjector;
 
 #[cfg(not(windows))]

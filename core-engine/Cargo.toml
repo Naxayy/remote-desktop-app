@@ -16,6 +16,17 @@ tracing = "0.1"
 jpeg-encoder = "0.6"
 image = { version = "0.24", default-features = false, features = ["jpeg"] }
 
+# Cifrado end-to-end de la sesion (Diffie-Hellman + AEAD). Todo Rust
+# puro, sin libs nativas.
+x25519-dalek = { version = "2", features = ["getrandom"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+# Pin de sandbox (cargo 1.75 viejo, no soporta edition2024 - en tu
+# maquina con rustup al dia probablemente no haga falta).
+zeroize = "=1.7.0"
+zeroize_derive = "=1.4.2"
+
 # API de captura DXGI e input, solo se compila en Windows
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

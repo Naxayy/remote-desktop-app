@@ -100,6 +100,14 @@ listen("restart-ack", () => {
   sessionStatus.textContent = "La PC remota se está reiniciando...";
 });
 
+listen("p2p-established", () => {
+  sessionStatus.textContent += " · conexión directa (P2P) activa";
+});
+
+listen("e2e-established", () => {
+  sessionStatus.textContent += " · cifrado end-to-end activo 🔒";
+});
+
 listen("file-incoming", (event) => {
   sessionStatus.textContent = `Recibiendo ${event.payload.name}...`;
 });

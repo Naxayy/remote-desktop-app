@@ -20,7 +20,11 @@ fn main() -> anyhow::Result<()> {
     let encoder = VideoEncoder::new(quality);
 
     let mut capturer = ScreenCapturer::new()?;
-    let first = capturer.next_frame()?;
+    let mut first = capturer.next_frame()?;
+    while first.is_none() {
+        first = capturer.next_frame()?;
+    }
+    let first = first.unwrap();
     let (width, height) = (first.width as usize, first.height as usize);
 
     let mut window = Window::new(
@@ -46,7 +50,10 @@ fn main() -> anyhow::Result<()> {
 
     while window.is_open() {
         let t0 = Instant::now();
-        let raw_frame = capturer.next_frame()?;
+        let Some(raw_frame) = capturer.next_frame()? else {
+            window.update();
+            continue;
+        };
         let t1 = Instant::now();
 
         let compressed = encoder.encode(&raw_frame)?;

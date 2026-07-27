@@ -13,6 +13,9 @@ pub const KIND_FRAME: u8 = 1;
 pub const KIND_INPUT: u8 = 2;
 pub const KIND_CONTROL: u8 = 3;
 pub const KIND_FILE: u8 = 4;
+pub const KIND_P2P_CANDIDATE: u8 = 5;
+pub const KIND_KEY_EXCHANGE: u8 = 6;
+pub const KIND_ENCRYPTED: u8 = 7;
 
 /// Tamaño de cada pedazo al trocear un archivo para mandarlo. 64KB es
 /// chico de sobra para cualquier limite de tamaño de mensaje
@@ -151,6 +154,71 @@ pub fn decode_control(data: &[u8]) -> Option<ControlEvent> {
 /// a que decoder mandarlo sin tener que probar los tres.
 pub fn peek_kind(data: &[u8]) -> Option<u8> {
     data.first().copied()
+}
+
+/// Anuncia nuestra direccion candidata para intentar P2P directo (la
+/// que devolvio STUN). Viaja por el mismo relay ya emparejado - una
+/// vez que ambas puntas se mandan su candidato, cada una intenta el
+/// hole punching por su cuenta. Solo IPv4 por ahora.
+pub fn encode_p2p_candidate(addr: std::net::SocketAddrV4) -> Vec<u8> {
+    let mut out = Vec::with_capacity(7);
+    out.push(KIND_P2P_CANDIDATE);
+    out.extend_from_slice(&addr.ip().octets());
+    out.extend_from_slice(&addr.port().to_le_bytes());
+    out
+}
+
+pub fn decode_p2p_candidate(data: &[u8]) -> Option<std::net::SocketAddrV4> {
+    if data.first() != Some(&KIND_P2P_CANDIDATE) {
+        return None;
+    }
+    let body = data.get(1..)?;
+    let ip = std::net::Ipv4Addr::new(*body.get(0)?, *body.get(1)?, *body.get(2)?, *body.get(3)?);
+    let port = u16::from_le_bytes([*body.get(4)?, *body.get(5)?]);
+    Some(std::net::SocketAddrV4::new(ip, port))
+}
+
+/// Intercambio de clave publica X25519 para el cifrado end-to-end.
+/// Viaja SIN cifrar (todavia no hay clave compartida en este punto) -
+/// eso es normal y seguro en un Diffie-Hellman: la clave publica no
+/// necesita ser secreta.
+pub fn encode_key_exchange(public_key: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(33);
+    out.push(KIND_KEY_EXCHANGE);
+    out.extend_from_slice(public_key);
+    out
+}
+
+pub fn decode_key_exchange(data: &[u8]) -> Option<[u8; 32]> {
+    if data.first() != Some(&KIND_KEY_EXCHANGE) {
+        return None;
+    }
+    let body = data.get(1..33)?;
+    body.try_into().ok()
+}
+
+/// Sobre cifrado: una vez que ambas puntas derivaron la clave
+/// compartida, TODO lo demas (frame/input/archivo/control/candidato
+/// P2P) viaja envuelto asi. El signaling-server sigue viendo estos
+/// bytes al hacer el relay, pero no puede leer el contenido.
+pub fn encode_encrypted(nonce: &[u8; 12], ciphertext: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 12 + ciphertext.len());
+    out.push(KIND_ENCRYPTED);
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(ciphertext);
+    out
+}
+
+/// Devuelve (nonce, ciphertext) si `data` es un mensaje cifrado.
+pub fn decode_encrypted(data: &[u8]) -> Option<(&[u8], &[u8])> {
+    if data.first() != Some(&KIND_ENCRYPTED) {
+        return None;
+    }
+    let body = data.get(1..)?;
+    if body.len() < 12 {
+        return None;
+    }
+    Some((&body[..12], &body[12..]))
 }
 
 /// Transferencia de archivos entre agent y controller. Simetrico:
@@ -322,5 +390,29 @@ mod tests {
     fn file_event_rejects_wrong_kind() {
         let input_bytes = encode_input(InputEvent::MouseWheel { delta: 1 });
         assert_eq!(decode_file(&input_bytes), None);
+    }
+
+    #[test]
+    fn p2p_candidate_roundtrip() {
+        let addr = std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 1, 42), 51820);
+        let encoded = encode_p2p_candidate(addr);
+        assert_eq!(decode_p2p_candidate(&encoded), Some(addr));
+    }
+
+    #[test]
+    fn key_exchange_roundtrip() {
+        let pubkey = [7u8; 32];
+        let encoded = encode_key_exchange(&pubkey);
+        assert_eq!(decode_key_exchange(&encoded), Some(pubkey));
+    }
+
+    #[test]
+    fn encrypted_envelope_roundtrip() {
+        let nonce = [1u8; 12];
+        let ciphertext = vec![9, 8, 7, 6, 5];
+        let encoded = encode_encrypted(&nonce, &ciphertext);
+        let (decoded_nonce, decoded_ct) = decode_encrypted(&encoded).unwrap();
+        assert_eq!(decoded_nonce, &nonce);
+        assert_eq!(decoded_ct, &ciphertext[..]);
     }
 }

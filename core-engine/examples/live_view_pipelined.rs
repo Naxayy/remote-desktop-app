@@ -44,7 +44,9 @@ fn main() -> anyhow::Result<()> {
             let mut window_start = Instant::now();
 
             loop {
-                let raw = capturer.next_frame()?;
+                let Some(raw) = capturer.next_frame()? else {
+                    continue;
+                };
                 let compressed = encoder.encode(&raw)?;
 
                 *latest.lock().unwrap() = Some(compressed);

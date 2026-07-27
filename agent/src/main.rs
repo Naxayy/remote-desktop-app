@@ -3,16 +3,19 @@
 //! Flujo actual:
 //! 1. Se conecta al signaling-server y se registra con un codigo.
 //! 2. Cuando un controller se empareja (mensaje "paired"), arranca a
-//!    capturar+comprimir pantalla y mandar cada frame por el relay.
-//! 3. Si el controller se desconecta ("peer_disconnected"), pausa el
+//!    capturar+comprimir pantalla y mandar cada frame por el relay,
+//!    e inicia el handshake de cifrado end-to-end (Diffie-Hellman) y
+//!    el intento de P2P para el input.
+//! 3. Todo el trafico de aplicacion (video/input/archivos/control) se
+//!    cifra automaticamente en cuanto el handshake de cifrado
+//!    termina - si el peer no lo soporta (ej: una version vieja del
+//!    controller), simplemente se sigue sin cifrar, sin romper nada.
+//! 4. Si el controller se desconecta ("peer_disconnected"), pausa el
 //!    streaming (sigue registrado, listo para que alguien se reconecte).
-//!
-//! Todavia pendiente: input remoto entrante (por ahora el agent solo
-//! manda video, no procesa comandos de mouse/teclado del controller),
-//! servicio de Windows, y migrar de relay-por-signaling a P2P real.
 
 use anyhow::{Context, Result};
 use core_engine::capture::ScreenCapturer;
+use core_engine::crypto::{self, SessionCipher};
 use core_engine::encode::VideoEncoder;
 use core_engine::input::{InputInjector, MouseButton};
 use core_engine::netproto::{self, ControlEvent, InputEvent, OwnedFileEvent};
@@ -29,10 +32,34 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use x25519_dalek::EphemeralSecret;
 
 /// Calidad JPEG de partida. Mas adelante esto deberia ajustarse en
 /// vivo segun el ancho de banda disponible.
 const QUALITY: u8 = 50;
+
+/// Estado del cifrado end-to-end compartido entre tareas: la clave
+/// efimera propia (se consume al recibir la clave publica del peer) y
+/// el cifrador ya derivado (una vez que el handshake termino).
+#[derive(Default)]
+struct CryptoState {
+    my_secret: Mutex<Option<EphemeralSecret>>,
+    cipher: Mutex<Option<Arc<SessionCipher>>>,
+}
+
+/// Envuelve un mensaje saliente: si el handshake de cifrado ya
+/// termino, lo cifra; si no, lo manda tal cual (esto es lo que hace
+/// que todo siga funcionando con un peer que no soporte cifrado).
+fn wrap_outgoing(crypto: &CryptoState, plaintext: Vec<u8>) -> Vec<u8> {
+    let guard = crypto.cipher.lock().unwrap();
+    match guard.as_ref() {
+        Some(cipher) => {
+            let (nonce, ciphertext) = cipher.encrypt(&plaintext);
+            netproto::encode_encrypted(&nonce, &ciphertext)
+        }
+        None => plaintext,
+    }
+}
 
 /// Transferencia de archivo entrante en progreso.
 struct IncomingTransfer {
@@ -55,9 +82,6 @@ fn received_files_dir() -> PathBuf {
 fn handle_file_bytes(transfers: &mut HashMap<u32, IncomingTransfer>, data: &[u8]) {
     match netproto::decode_file(data) {
         Some(OwnedFileEvent::Offer { transfer_id, name, total_size }) => {
-            // Sanitizar: nos quedamos solo con el nombre de archivo,
-            // sin separadores de path, para que el controller no
-            // pueda escribir fuera de la carpeta de destino.
             let safe_name = std::path::Path::new(&name)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -122,10 +146,6 @@ fn handle_input_bytes(injector: &InputInjector, data: &[u8]) {
     }
 }
 
-/// Ejecuta un reinicio real de Windows via el comando `shutdown`, con
-/// el margen que pidio el controller. Usamos el comando del sistema
-/// en vez de una API directa porque ya se encarga de avisarle a las
-/// demas apps abiertas y de dar el margen configurado.
 #[cfg(windows)]
 fn trigger_restart(delay_secs: u8) {
     tracing::warn!("reinicio remoto pedido - ejecutando en {delay_secs}s");
@@ -142,17 +162,92 @@ fn trigger_restart(_delay_secs: u8) {
     tracing::warn!("reinicio remoto pedido, pero no esta implementado fuera de Windows");
 }
 
-fn handle_control_bytes(out_tx: &mpsc::UnboundedSender<Message>, data: &[u8]) {
+fn handle_control_bytes(out_tx: &mpsc::UnboundedSender<Message>, crypto: &CryptoState, data: &[u8]) {
     match netproto::decode_control(data) {
         Some(ControlEvent::RestartRequest { delay_secs }) => {
             trigger_restart(delay_secs);
             let ack = netproto::encode_control(ControlEvent::RestartAck);
-            let _ = out_tx.send(Message::Binary(ack));
+            let _ = out_tx.send(Message::Binary(wrap_outgoing(crypto, ack)));
         }
         Some(ControlEvent::RestartAck) => {
             // El agent no espera recibir esto, es el agent el que lo manda.
         }
         None => {}
+    }
+}
+
+/// Intenta establecer un path P2P directo para el input (mejor
+/// latencia que pasar por el relay). Es pura optimizacion: si algo
+/// falla en cualquier paso, simplemente no hace nada mas y el input
+/// sigue llegando por el relay de siempre, sin que el usuario note
+/// nada raro.
+async fn setup_p2p(
+    out_tx: mpsc::UnboundedSender<Message>,
+    injector: InputInjector,
+    mut peer_candidate_rx: mpsc::UnboundedReceiver<std::net::SocketAddrV4>,
+) {
+    let socket = match core_engine::net::bind_local_socket().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!("P2P: no se pudo bindear el socket UDP, sigo con el relay ({e:#})");
+            return;
+        }
+    };
+
+    let stun_server = "stun.l.google.com:19302";
+    let my_candidate = match core_engine::net::stun_discover(&socket, stun_server).await {
+        Ok(std::net::SocketAddr::V4(v4)) => v4,
+        Ok(_) => {
+            tracing::info!("P2P: STUN devolvio una direccion IPv6, no soportado todavia");
+            return;
+        }
+        Err(e) => {
+            tracing::info!("P2P: STUN fallo, sigo con el relay ({e:#})");
+            return;
+        }
+    };
+    tracing::info!("P2P: mi candidato es {my_candidate}");
+    // El candidato viaja siempre SIN cifrar (a proposito): si lo
+    // envolvieramos con wrap_outgoing, podria salir cifrado apenas
+    // nuestro propio handshake termina, mientras el peer todavia no
+    // tiene la clave lista de su lado - el mensaje se perderia. No es
+    // informacion sensible (solo IP:puerto), asi que no hace falta.
+    let _ = out_tx.send(Message::Binary(netproto::encode_p2p_candidate(my_candidate)));
+
+    let peer_candidate =
+        match tokio::time::timeout(Duration::from_secs(5), peer_candidate_rx.recv()).await {
+            Ok(Some(addr)) => addr,
+            _ => {
+                tracing::info!("P2P: no llego el candidato del controller a tiempo, sigo con el relay");
+                return;
+            }
+        };
+    tracing::info!("P2P: candidato del controller es {peer_candidate}");
+
+    let peer_addr = std::net::SocketAddr::V4(peer_candidate);
+    match core_engine::net::punch_hole(&socket, peer_addr, 5).await {
+        Some(confirmed_addr) => {
+            tracing::info!("P2P establecido con {confirmed_addr} - el input puede llegar directo ahora");
+            let mut buf = [0u8; 1500];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, from)) if from == confirmed_addr => {
+                        if buf[..len].first() == Some(&core_engine::net::P2P_PING_MARKER) {
+                            continue; // solo era un keepalive
+                        }
+                        handle_input_bytes(&injector, &buf[..len]);
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::info!("P2P: socket cerrado ({e}), sigo solo con el relay");
+                        break;
+                    }
+                }
+            }
+        }
+        None => {
+            tracing::info!("P2P: no se pudo abrir el path directo, sigo con el relay");
+        }
     }
 }
 
@@ -175,7 +270,9 @@ fn spawn_capture_thread(
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
-                    let frame = capturer.next_frame()?;
+                    let Some(frame) = capturer.next_frame()? else {
+                        continue;
+                    };
                     let compressed = encoder.encode(&frame)?;
                     *latest.lock().unwrap() = Some(compressed);
                     frame_id.fetch_add(1, Ordering::Relaxed);
@@ -210,7 +307,6 @@ pub async fn run_agent() -> Result<()> {
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
 
-    // Tarea que vuelca el canal de salida al socket real.
     tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if write.send(msg).await.is_err() {
@@ -226,20 +322,26 @@ pub async fn run_agent() -> Result<()> {
     let latest: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
     let frame_id = Arc::new(AtomicU64::new(0));
     let paired = Arc::new(AtomicBool::new(false));
+    let crypto = Arc::new(CryptoState::default());
 
     spawn_capture_thread(Arc::clone(&latest), Arc::clone(&frame_id), Arc::clone(&paired));
 
     let input_injector = InputInjector::new();
     let mut incoming_transfers: HashMap<u32, IncomingTransfer> = HashMap::new();
 
-    // Tarea que manda por la red el ultimo frame disponible. No manda
-    // mas rapido de lo que hay frames nuevos (chequea cada 5ms, que da
-    // margen de sobra hasta para 60fps).
+    let (peer_candidate_tx, peer_candidate_rx) =
+        mpsc::unbounded_channel::<std::net::SocketAddrV4>();
+    let mut peer_candidate_rx = Some(peer_candidate_rx);
+    let mut p2p_attempted = false;
+
+    // Tarea que manda por la red el ultimo frame disponible, cifrado
+    // si el handshake ya termino.
     {
         let latest = Arc::clone(&latest);
         let frame_id = Arc::clone(&frame_id);
         let paired = Arc::clone(&paired);
         let out_tx = out_tx.clone();
+        let crypto = Arc::clone(&crypto);
         tokio::spawn(async move {
             let mut last_sent = 0u64;
             loop {
@@ -254,17 +356,13 @@ pub async fn run_agent() -> Result<()> {
                 last_sent = current;
                 let frame = { latest.lock().unwrap().clone() };
                 if let Some(frame) = frame {
-                    let msg = netproto::encode_frame(&frame);
+                    let msg = wrap_outgoing(&crypto, netproto::encode_frame(&frame));
                     let _ = out_tx.send(Message::Binary(msg));
                 }
             }
         });
     }
 
-    // Loop principal: los mensajes de TEXTO son control del signaling
-    // server (registro confirmado, emparejamiento, etc), los de
-    // BINARIO son eventos de input que manda el controller una vez
-    // emparejados.
     while let Some(msg) = read.next().await {
         let msg = match msg {
             Ok(m) => m,
@@ -287,6 +385,23 @@ pub async fn run_agent() -> Result<()> {
                     Some("paired") => {
                         tracing::info!("controller conectado - arrancando streaming");
                         paired.store(true, Ordering::Relaxed);
+
+                        // Cifrado E2E: generamos nuestro par de claves
+                        // efimero y lo mandamos. Si el peer no
+                        // participa del handshake (version vieja del
+                        // controller), no llega respuesta y seguimos
+                        // sin cifrar - no rompe nada.
+                        let (secret, public_bytes) = crypto::generate_keypair();
+                        *crypto.my_secret.lock().unwrap() = Some(secret);
+                        let _ = out_tx.send(Message::Binary(netproto::encode_key_exchange(&public_bytes)));
+
+                        if !p2p_attempted {
+                            p2p_attempted = true;
+                            if let Some(rx) = peer_candidate_rx.take() {
+                                let out_tx_p2p = out_tx.clone();
+                                tokio::spawn(setup_p2p(out_tx_p2p, input_injector, rx));
+                            }
+                        }
                     }
                     Some("peer_disconnected") => {
                         tracing::info!("controller desconectado - pausando streaming");
@@ -298,12 +413,59 @@ pub async fn run_agent() -> Result<()> {
                     _ => {}
                 }
             }
-            Message::Binary(bytes) => match netproto::peek_kind(&bytes) {
-                Some(netproto::KIND_INPUT) => handle_input_bytes(&input_injector, &bytes),
-                Some(netproto::KIND_CONTROL) => handle_control_bytes(&out_tx, &bytes),
-                Some(netproto::KIND_FILE) => handle_file_bytes(&mut incoming_transfers, &bytes),
-                _ => {}
-            },
+            Message::Binary(bytes) => {
+                // El intercambio de clave nunca viaja cifrado (es el
+                // handshake mismo) - se procesa aparte.
+                if netproto::peek_kind(&bytes) == Some(netproto::KIND_KEY_EXCHANGE) {
+                    if let Some(peer_public) = netproto::decode_key_exchange(&bytes) {
+                        let secret = crypto.my_secret.lock().unwrap().take();
+                        if let Some(secret) = secret {
+                            let key = crypto::derive_session_key(secret, peer_public);
+                            *crypto.cipher.lock().unwrap() = Some(Arc::new(SessionCipher::new(key)));
+                            tracing::info!("cifrado end-to-end establecido con el controller");
+                        }
+                    }
+                    continue;
+                }
+
+                // Si viene cifrado, lo desciframos y seguimos con el
+                // contenido real; si no, lo tratamos tal cual (permite
+                // seguir hablando con un peer que no soporte cifrado).
+                let decrypted_owner;
+                let effective: &[u8] = if netproto::peek_kind(&bytes) == Some(netproto::KIND_ENCRYPTED) {
+                    let cipher_guard = crypto.cipher.lock().unwrap();
+                    match (cipher_guard.as_ref(), netproto::decode_encrypted(&bytes)) {
+                        (Some(cipher), Some((nonce, ciphertext))) => match cipher.decrypt(nonce, ciphertext) {
+                            Ok(plain) => {
+                                decrypted_owner = plain;
+                                &decrypted_owner
+                            }
+                            Err(e) => {
+                                tracing::warn!("no se pudo descifrar un mensaje: {e}");
+                                continue;
+                            }
+                        },
+                        _ => {
+                            tracing::warn!("mensaje cifrado recibido pero todavia no tengo la clave");
+                            continue;
+                        }
+                    }
+                } else {
+                    &bytes
+                };
+
+                match netproto::peek_kind(effective) {
+                    Some(netproto::KIND_INPUT) => handle_input_bytes(&input_injector, effective),
+                    Some(netproto::KIND_CONTROL) => handle_control_bytes(&out_tx, &crypto, effective),
+                    Some(netproto::KIND_FILE) => handle_file_bytes(&mut incoming_transfers, effective),
+                    Some(netproto::KIND_P2P_CANDIDATE) => {
+                        if let Some(addr) = netproto::decode_p2p_candidate(effective) {
+                            let _ = peer_candidate_tx.send(addr);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Message::Close(_) => break,
             _ => {}
         }
@@ -334,11 +496,6 @@ fn main() -> Result<()> {
             Some("uninstall") => return service::uninstall(),
             Some("console") => return run_console_mode(),
             _ => {
-                // Sin argumentos: si el SCM nos esta lanzando como
-                // servicio, esto atiende ese arranque y no vuelve
-                // hasta que el servicio para. Si NO nos lanzo el SCM
-                // (ej: doble click en el exe), start_dispatcher falla
-                // enseguida y caemos al modo consola.
                 if service::start_dispatcher().is_ok() {
                     return Ok(());
                 }
@@ -352,7 +509,7 @@ fn main() -> Result<()> {
 
     #[cfg(not(windows))]
     {
-        let _ = command; // install/uninstall/service no aplican fuera de Windows
+        let _ = command;
         run_console_mode()
     }
 }

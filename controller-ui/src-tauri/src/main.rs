@@ -1,6 +1,6 @@
-//! Backend Rust de la app controladora (Tauri). Reemplaza a dev_viewer:
-//! misma logica de red (conectarse al signaling server, emparejarse,
-//! mandar/recibir video-input-archivos-control via netproto), pero
+//! Backend Rust de la app controladora (Tauri). Misma logica de red
+//! que el agent (conectarse al signaling server, emparejarse, cifrado
+//! end-to-end, P2P, video/input/archivos/control via netproto), pero
 //! expuesta como comandos Tauri para que el frontend (HTML/JS) la
 //! use, y eventos para que el frontend reciba lo que llega de la red.
 //!
@@ -13,6 +13,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use core_engine::crypto::{self, SessionCipher};
 use core_engine::netproto::{self, ControlEvent, FileEvent, InputEvent, OwnedFileEvent};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -21,17 +22,45 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+use x25519_dalek::EphemeralSecret;
+
+/// Estado del cifrado end-to-end: la clave efimera propia (se
+/// consume al recibir la clave publica del agent) y el cifrador ya
+/// derivado, una vez que el handshake termino.
+#[derive(Default)]
+struct CryptoState {
+    my_secret: Mutex<Option<EphemeralSecret>>,
+    cipher: Mutex<Option<Arc<SessionCipher>>>,
+}
+
+/// Envuelve un mensaje saliente: si el handshake de cifrado ya
+/// termino, lo cifra; si no, lo manda tal cual (permite seguir
+/// hablando con un agent que no soporte cifrado).
+async fn wrap_outgoing(crypto: &CryptoState, plaintext: Vec<u8>) -> Vec<u8> {
+    let guard = crypto.cipher.lock().await;
+    match guard.as_ref() {
+        Some(cipher) => {
+            let (nonce, ciphertext) = cipher.encrypt(&plaintext);
+            netproto::encode_encrypted(&nonce, &ciphertext)
+        }
+        None => plaintext,
+    }
+}
 
 /// Estado compartido: el canal para mandar mensajes por la conexion
-/// activa (si hay una). Envuelto en Mutex porque varios comandos
-/// Tauri pueden querer mandar cosas a la vez (input llega seguido).
+/// activa, el path P2P directo si se logro establecer, y el estado
+/// de cifrado de la sesion actual.
 #[derive(Default)]
 struct AppState {
     out_tx: Mutex<Option<mpsc::UnboundedSender<Message>>>,
+    p2p: Mutex<Option<(UdpSocket, std::net::SocketAddr)>>,
+    crypto: CryptoState,
 }
 
 #[derive(Serialize, Clone)]
@@ -84,9 +113,15 @@ async fn connect(
         ))
         .map_err(|e| e.to_string())?;
 
+    let out_tx_for_reader = out_tx.clone();
     *state.out_tx.lock().await = Some(out_tx);
 
     let app_handle = app.clone();
+    let (peer_candidate_tx, peer_candidate_rx) =
+        mpsc::unbounded_channel::<std::net::SocketAddrV4>();
+    let mut peer_candidate_rx = Some(peer_candidate_rx);
+    let out_tx = out_tx_for_reader;
+
     tokio::spawn(async move {
         struct IncomingTransfer {
             file: File,
@@ -107,6 +142,30 @@ async fn connect(
                         match parsed["type"].as_str() {
                             Some("paired") => {
                                 let _ = app_handle.emit("paired", ());
+
+                                let app_state = app_handle.state::<AppState>();
+
+                                // Cifrado E2E: generamos nuestro par de
+                                // claves efimero y lo mandamos. Si el
+                                // agent no participa del handshake
+                                // (version vieja), no llega respuesta y
+                                // seguimos sin cifrar - no rompe nada.
+                                let (secret, public_bytes) = crypto::generate_keypair();
+                                *app_state.crypto.my_secret.lock().await = Some(secret);
+                                let _ = out_tx.send(Message::Binary(netproto::encode_key_exchange(&public_bytes)));
+
+                                // Intentamos abrir un path P2P directo
+                                // para el input (mejor latencia). Es
+                                // una optimizacion - si falla en
+                                // cualquier paso, seguimos mandando
+                                // input por el relay sin que se note.
+                                if let Some(rx) = peer_candidate_rx.take() {
+                                    let app_handle_p2p = app_handle.clone();
+                                    let out_tx_p2p = out_tx.clone();
+                                    tokio::spawn(async move {
+                                        setup_p2p(app_handle_p2p, out_tx_p2p, rx).await;
+                                    });
+                                }
                             }
                             Some("peer_disconnected") => {
                                 let _ = app_handle.emit("peer-disconnected", ());
@@ -122,53 +181,93 @@ async fn connect(
                         }
                     }
                 }
-                Message::Binary(bytes) => match netproto::peek_kind(&bytes) {
-                    Some(netproto::KIND_FRAME) => {
-                        if let Some(jpeg) = netproto::decode_frame(&bytes) {
-                            // Base64 aca no cuesta nada de ancho de banda de
-                            // red - es una llamada local entre el backend
-                            // Rust y el WebView, no viaja por internet.
-                            let b64 = STANDARD.encode(jpeg);
-                            let _ = app_handle.emit("video-frame", b64);
-                        }
-                    }
-                    Some(netproto::KIND_CONTROL) => {
-                        if let Some(ControlEvent::RestartAck) = netproto::decode_control(&bytes) {
-                            let _ = app_handle.emit("restart-ack", ());
-                        }
-                    }
-                    Some(netproto::KIND_FILE) => match netproto::decode_file(&bytes) {
-                        Some(OwnedFileEvent::Offer { transfer_id, name, total_size }) => {
-                            let safe_name = std::path::Path::new(&name)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "archivo_recibido".to_string());
-                            let dest = received_dir.join(&safe_name);
-                            if let Ok(file) = File::create(&dest) {
-                                incoming.insert(transfer_id, IncomingTransfer { file, path: dest });
-                            }
-                            let _ = app_handle.emit(
-                                "file-incoming",
-                                FileIncomingPayload { name: safe_name, size: total_size },
-                            );
-                        }
-                        Some(OwnedFileEvent::Chunk { transfer_id, data }) => {
-                            if let Some(t) = incoming.get_mut(&transfer_id) {
-                                let _ = t.file.write_all(&data);
+                Message::Binary(bytes) => {
+                    let app_state = app_handle.state::<AppState>();
+
+                    // El intercambio de clave nunca viaja cifrado.
+                    if netproto::peek_kind(&bytes) == Some(netproto::KIND_KEY_EXCHANGE) {
+                        if let Some(peer_public) = netproto::decode_key_exchange(&bytes) {
+                            let secret = app_state.crypto.my_secret.lock().await.take();
+                            if let Some(secret) = secret {
+                                let key = crypto::derive_session_key(secret, peer_public);
+                                *app_state.crypto.cipher.lock().await = Some(Arc::new(SessionCipher::new(key)));
+                                let _ = app_handle.emit("e2e-established", ());
                             }
                         }
-                        Some(OwnedFileEvent::Complete { transfer_id }) => {
-                            if let Some(t) = incoming.remove(&transfer_id) {
+                        continue;
+                    }
+
+                    // Si viene cifrado, lo desciframos primero.
+                    let decrypted_owner;
+                    let effective: &[u8] = if netproto::peek_kind(&bytes) == Some(netproto::KIND_ENCRYPTED) {
+                        let cipher_guard = app_state.crypto.cipher.lock().await;
+                        match (cipher_guard.as_ref(), netproto::decode_encrypted(&bytes)) {
+                            (Some(cipher), Some((nonce, ciphertext))) => match cipher.decrypt(nonce, ciphertext) {
+                                Ok(plain) => {
+                                    decrypted_owner = plain;
+                                    &decrypted_owner
+                                }
+                                Err(_) => continue,
+                            },
+                            _ => continue,
+                        }
+                    } else {
+                        &bytes
+                    };
+
+                    match netproto::peek_kind(effective) {
+                        Some(netproto::KIND_FRAME) => {
+                            if let Some(jpeg) = netproto::decode_frame(effective) {
+                                // Base64 aca no cuesta ancho de banda de
+                                // red - es una llamada local entre el
+                                // backend Rust y el WebView.
+                                let b64 = STANDARD.encode(jpeg);
+                                let _ = app_handle.emit("video-frame", b64);
+                            }
+                        }
+                        Some(netproto::KIND_CONTROL) => {
+                            if let Some(ControlEvent::RestartAck) = netproto::decode_control(effective) {
+                                let _ = app_handle.emit("restart-ack", ());
+                            }
+                        }
+                        Some(netproto::KIND_P2P_CANDIDATE) => {
+                            if let Some(addr) = netproto::decode_p2p_candidate(effective) {
+                                let _ = peer_candidate_tx.send(addr);
+                            }
+                        }
+                        Some(netproto::KIND_FILE) => match netproto::decode_file(effective) {
+                            Some(OwnedFileEvent::Offer { transfer_id, name, total_size }) => {
+                                let safe_name = std::path::Path::new(&name)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "archivo_recibido".to_string());
+                                let dest = received_dir.join(&safe_name);
+                                if let Ok(file) = File::create(&dest) {
+                                    incoming.insert(transfer_id, IncomingTransfer { file, path: dest });
+                                }
                                 let _ = app_handle.emit(
-                                    "file-received",
-                                    t.path.to_string_lossy().to_string(),
+                                    "file-incoming",
+                                    FileIncomingPayload { name: safe_name, size: total_size },
                                 );
                             }
-                        }
-                        None => {}
-                    },
-                    _ => {}
-                },
+                            Some(OwnedFileEvent::Chunk { transfer_id, data }) => {
+                                if let Some(t) = incoming.get_mut(&transfer_id) {
+                                    let _ = t.file.write_all(&data);
+                                }
+                            }
+                            Some(OwnedFileEvent::Complete { transfer_id }) => {
+                                if let Some(t) = incoming.remove(&transfer_id) {
+                                    let _ = app_handle.emit(
+                                        "file-received",
+                                        t.path.to_string_lossy().to_string(),
+                                    );
+                                }
+                            }
+                            None => {}
+                        },
+                        _ => {}
+                    }
+                }
                 Message::Close(_) => break,
                 _ => {}
             }
@@ -179,7 +278,84 @@ async fn connect(
     Ok(())
 }
 
-async fn send_bytes(state: &State<'_, AppState>, msg: Vec<u8>) -> Result<(), String> {
+/// Intenta abrir un path P2P directo para el input (mejor latencia
+/// que el relay). Optimizacion pura: si algo falla, no hace nada mas
+/// y el input sigue viajando por el relay de siempre.
+async fn setup_p2p(
+    app_handle: AppHandle,
+    out_tx: mpsc::UnboundedSender<Message>,
+    mut peer_candidate_rx: mpsc::UnboundedReceiver<std::net::SocketAddrV4>,
+) {
+    let socket = match core_engine::net::bind_local_socket().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!("P2P: no se pudo bindear el socket UDP, sigo con el relay ({e:#})");
+            return;
+        }
+    };
+
+    let stun_server = "stun.l.google.com:19302";
+    let my_candidate = match core_engine::net::stun_discover(&socket, stun_server).await {
+        Ok(std::net::SocketAddr::V4(v4)) => v4,
+        Ok(_) => {
+            tracing::info!("P2P: STUN devolvio IPv6, no soportado todavia");
+            return;
+        }
+        Err(e) => {
+            tracing::info!("P2P: STUN fallo, sigo con el relay ({e:#})");
+            return;
+        }
+    };
+    // El candidato viaja siempre SIN cifrar, por el mismo motivo que
+    // en el agent: evita la carrera con el handshake de cifrado (no
+    // es informacion sensible de todos modos).
+    let _ = out_tx.send(Message::Binary(netproto::encode_p2p_candidate(my_candidate)));
+
+    let peer_candidate =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), peer_candidate_rx.recv()).await {
+            Ok(Some(addr)) => addr,
+            _ => {
+                tracing::info!("P2P: no llego el candidato del agent a tiempo, sigo con el relay");
+                return;
+            }
+        };
+
+    let peer_addr = std::net::SocketAddr::V4(peer_candidate);
+    match core_engine::net::punch_hole(&socket, peer_addr, 5).await {
+        Some(confirmed_addr) => {
+            tracing::info!("P2P establecido con {confirmed_addr}");
+            *app_handle.state::<AppState>().p2p.lock().await = Some((socket, confirmed_addr));
+            let _ = app_handle.emit("p2p-established", ());
+        }
+        None => {
+            tracing::info!("P2P: no se pudo abrir el path directo, sigo con el relay");
+        }
+    }
+}
+
+async fn send_bytes(state: &State<'_, AppState>, plaintext: Vec<u8>) -> Result<(), String> {
+    let msg = wrap_outgoing(&state.crypto, plaintext).await;
+    let guard = state.out_tx.lock().await;
+    match guard.as_ref() {
+        Some(tx) => tx.send(Message::Binary(msg)).map_err(|e| e.to_string()),
+        None => Err("no hay conexion activa".to_string()),
+    }
+}
+
+/// Como send_bytes, pero para eventos de input: si hay un path P2P
+/// establecido, lo manda directo por UDP (mas rapido); si no, cae al
+/// relay de siempre via WebSocket. El input tambien se cifra en
+/// cualquiera de los dos caminos.
+async fn send_input_bytes(state: &State<'_, AppState>, plaintext: Vec<u8>) -> Result<(), String> {
+    let msg = wrap_outgoing(&state.crypto, plaintext).await;
+    {
+        let p2p_guard = state.p2p.lock().await;
+        if let Some((socket, addr)) = p2p_guard.as_ref() {
+            if socket.send_to(&msg, *addr).await.is_ok() {
+                return Ok(());
+            }
+        }
+    }
     let guard = state.out_tx.lock().await;
     match guard.as_ref() {
         Some(tx) => tx.send(Message::Binary(msg)).map_err(|e| e.to_string()),
@@ -189,22 +365,22 @@ async fn send_bytes(state: &State<'_, AppState>, msg: Vec<u8>) -> Result<(), Str
 
 #[tauri::command]
 async fn send_mouse_move(state: State<'_, AppState>, x: f32, y: f32) -> Result<(), String> {
-    send_bytes(&state, netproto::encode_input(InputEvent::MouseMove { x, y })).await
+    send_input_bytes(&state, netproto::encode_input(InputEvent::MouseMove { x, y })).await
 }
 
 #[tauri::command]
 async fn send_mouse_button(state: State<'_, AppState>, button: u8, pressed: bool) -> Result<(), String> {
-    send_bytes(&state, netproto::encode_input(InputEvent::MouseButton { button, pressed })).await
+    send_input_bytes(&state, netproto::encode_input(InputEvent::MouseButton { button, pressed })).await
 }
 
 #[tauri::command]
 async fn send_mouse_wheel(state: State<'_, AppState>, delta: i32) -> Result<(), String> {
-    send_bytes(&state, netproto::encode_input(InputEvent::MouseWheel { delta })).await
+    send_input_bytes(&state, netproto::encode_input(InputEvent::MouseWheel { delta })).await
 }
 
 #[tauri::command]
 async fn send_key(state: State<'_, AppState>, vk: u16, pressed: bool) -> Result<(), String> {
-    send_bytes(&state, netproto::encode_input(InputEvent::Key { vk, pressed })).await
+    send_input_bytes(&state, netproto::encode_input(InputEvent::Key { vk, pressed })).await
 }
 
 #[tauri::command]
@@ -241,6 +417,8 @@ async fn send_file(state: State<'_, AppState>, path: String) -> Result<(), Strin
 }
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![

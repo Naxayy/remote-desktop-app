@@ -12,9 +12,14 @@ fn main() -> anyhow::Result<()> {
 
     let mut capturer = ScreenCapturer::new()?;
 
-    // Creamos la ventana recien despues del primer frame para saber
-    // las dimensiones reales del monitor capturado.
-    let first = capturer.next_frame()?;
+    // Creamos la ventana recien despues del primer frame real, para
+    // saber las dimensiones del monitor capturado (el primer intento
+    // puede devolver None si la pantalla no cambio todavia).
+    let mut first = capturer.next_frame()?;
+    while first.is_none() {
+        first = capturer.next_frame()?;
+    }
+    let first = first.unwrap();
     let (width, height) = (first.width as usize, first.height as usize);
 
     let mut window = Window::new(
@@ -28,7 +33,10 @@ fn main() -> anyhow::Result<()> {
     let mut buffer: Vec<u32> = vec![0; width * height];
 
     while window.is_open() {
-        let frame = capturer.next_frame()?;
+        let Some(frame) = capturer.next_frame()? else {
+            window.update();
+            continue;
+        };
 
         // BGRA8 (4 bytes por pixel) -> u32 0x00RRGGBB que espera minifb.
         for (i, px) in frame.data.chunks_exact(4).enumerate() {

@@ -27,7 +27,7 @@ impl ScreenCapturer {
         anyhow::bail!("la captura de pantalla solo esta implementada para Windows por ahora")
     }
 
-    pub fn next_frame(&mut self) -> anyhow::Result<Frame> {
+    pub fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
         anyhow::bail!("la captura de pantalla solo esta implementada para Windows por ahora")
     }
 }

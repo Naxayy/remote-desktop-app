@@ -18,7 +18,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_OUTDUPL_FRAME_INFO,
+    IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_WAIT_TIMEOUT,
+    DXGI_OUTDUPL_FRAME_INFO,
 };
 
 pub struct ScreenCapturer {
@@ -106,18 +107,28 @@ impl ScreenCapturer {
         }
     }
 
-    /// Bloquea hasta que Windows entregue el proximo frame (o timeout),
-    /// lo copia a memoria de CPU y lo devuelve como BGRA8 crudo.
-    pub fn next_frame(&mut self) -> Result<Frame> {
+    /// Espera hasta `timeout_ms` a que Windows entregue el proximo
+    /// frame. Devuelve `Ok(None)` si no hubo cambios en pantalla en
+    /// ese tiempo (caso normal - pasa todo el tiempo con la pantalla
+    /// quieta, no es un error). Devuelve `Err` solo ante fallos reales
+    /// (perdida de acceso por bloqueo de sesion, cambio de modo de
+    /// video, etc), que el llamador puede usar para recrear la
+    /// captura.
+    pub fn next_frame(&mut self) -> Result<Option<Frame>> {
         unsafe {
             let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
 
-            // timeout de 500ms: si no hay cambios en pantalla, DXGI no
-            // entrega frame nuevo dentro de ese tiempo.
-            self.duplication
-                .AcquireNextFrame(500, &mut frame_info, &mut resource)
-                .context("AcquireNextFrame fallo")?;
+            if let Err(e) =
+                self.duplication
+                    .AcquireNextFrame(500, &mut frame_info, &mut resource)
+            {
+                if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
+                    // Pantalla sin cambios en los ultimos 500ms - normal.
+                    return Ok(None);
+                }
+                return Err(e).context("AcquireNextFrame fallo");
+            }
 
             let resource = resource.context("resource nulo en AcquireNextFrame")?;
             let texture: ID3D11Texture2D = resource.cast()?;
@@ -145,11 +156,11 @@ impl ScreenCapturer {
             self.context.Unmap(&self.staging, 0);
             self.duplication.ReleaseFrame().ok();
 
-            Ok(Frame {
+            Ok(Some(Frame {
                 width: self.width,
                 height: self.height,
                 data,
-            })
+            }))
         }
     }
 }
