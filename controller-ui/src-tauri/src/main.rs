@@ -182,6 +182,7 @@ async fn connect(
                     }
                 }
                 Message::Binary(bytes) => {
+                    tracing::info!("mensaje binario recibido: {} bytes, kind={:?}", bytes.len(), netproto::peek_kind(&bytes));
                     let app_state = app_handle.state::<AppState>();
 
                     // El intercambio de clave nunca viaja cifrado.
@@ -191,8 +192,13 @@ async fn connect(
                             if let Some(secret) = secret {
                                 let key = crypto::derive_session_key(secret, peer_public);
                                 *app_state.crypto.cipher.lock().await = Some(Arc::new(SessionCipher::new(key)));
+                                tracing::info!("cifrado end-to-end establecido con el agent");
                                 let _ = app_handle.emit("e2e-established", ());
+                            } else {
+                                tracing::warn!("llego la clave del agent pero yo todavia no tenia mi propia clave generada");
                             }
+                        } else {
+                            tracing::warn!("mensaje de intercambio de clave con formato invalido");
                         }
                         continue;
                     }
@@ -207,13 +213,25 @@ async fn connect(
                                     decrypted_owner = plain;
                                     &decrypted_owner
                                 }
-                                Err(_) => continue,
+                                Err(e) => {
+                                    tracing::warn!("no se pudo descifrar un mensaje ({} bytes): {e}", bytes.len());
+                                    continue;
+                                }
                             },
-                            _ => continue,
+                            (None, _) => {
+                                tracing::warn!("llego un mensaje cifrado pero todavia no tengo la clave ({} bytes)", bytes.len());
+                                continue;
+                            }
+                            (_, None) => {
+                                tracing::warn!("mensaje cifrado con formato invalido ({} bytes)", bytes.len());
+                                continue;
+                            }
                         }
                     } else {
                         &bytes
                     };
+
+                    tracing::info!("mensaje efectivo tras descifrar (si aplicaba): kind={:?}, {} bytes", netproto::peek_kind(effective), effective.len());
 
                     match netproto::peek_kind(effective) {
                         Some(netproto::KIND_FRAME) => {

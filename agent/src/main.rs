@@ -344,6 +344,7 @@ pub async fn run_agent() -> Result<()> {
         let crypto = Arc::clone(&crypto);
         tokio::spawn(async move {
             let mut last_sent = 0u64;
+            let mut sent_count = 0u64;
             loop {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 if !paired.load(Ordering::Relaxed) {
@@ -357,7 +358,16 @@ pub async fn run_agent() -> Result<()> {
                 let frame = { latest.lock().unwrap().clone() };
                 if let Some(frame) = frame {
                     let msg = wrap_outgoing(&crypto, netproto::encode_frame(&frame));
-                    let _ = out_tx.send(Message::Binary(msg));
+                    let msg_len = msg.len();
+                    match out_tx.send(Message::Binary(msg)) {
+                        Ok(()) => {
+                            sent_count += 1;
+                            if sent_count == 1 || sent_count % 100 == 0 {
+                                tracing::info!("frame #{sent_count} mandado ({msg_len} bytes)");
+                            }
+                        }
+                        Err(e) => tracing::warn!("no se pudo encolar el frame para mandar: {e}"),
+                    }
                 }
             }
         });
