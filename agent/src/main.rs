@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -34,9 +34,11 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use x25519_dalek::EphemeralSecret;
 
-/// Calidad JPEG de partida. Mas adelante esto deberia ajustarse en
-/// vivo segun el ancho de banda disponible.
-const QUALITY: u8 = 50;
+/// Calidad JPEG de partida, y los limites entre los que se mueve el
+/// ajuste automatico segun como esta llegando el video del otro lado.
+const QUALITY_INITIAL: u8 = 50;
+const QUALITY_MIN: u8 = 20;
+const QUALITY_MAX: u8 = 75;
 
 /// Estado del cifrado end-to-end compartido entre tareas: la clave
 /// efimera propia (se consume al recibir la clave publica del peer) y
@@ -255,6 +257,7 @@ fn spawn_capture_thread(
     latest: Arc<Mutex<Option<Vec<u8>>>>,
     frame_id: Arc<AtomicU64>,
     paired: Arc<AtomicBool>,
+    quality: Arc<AtomicU8>,
 ) {
     thread::spawn(move || {
         // DXGI Desktop Duplication puede fallar en varias situaciones
@@ -264,7 +267,6 @@ fn spawn_capture_thread(
         loop {
             let run = || -> Result<()> {
                 let mut capturer = ScreenCapturer::new()?;
-                let encoder = VideoEncoder::new(QUALITY);
                 loop {
                     if !paired.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(100));
@@ -273,6 +275,11 @@ fn spawn_capture_thread(
                     let Some(frame) = capturer.next_frame()? else {
                         continue;
                     };
+                    // El encoder se recrea cada vez con la calidad
+                    // actual (es solo un u8 adentro, no cuesta nada) -
+                    // asi el ajuste automatico de calidad se aplica
+                    // frame a frame sin tener que reiniciar la captura.
+                    let encoder = VideoEncoder::new(quality.load(Ordering::Relaxed));
                     let compressed = encoder.encode(&frame)?;
                     *latest.lock().unwrap() = Some(compressed);
                     frame_id.fetch_add(1, Ordering::Relaxed);
@@ -284,6 +291,36 @@ fn spawn_capture_thread(
             }
         }
     });
+}
+
+/// Ajusta la calidad JPEG segun los fps que el controller reporta
+/// estar recibiendo de verdad, comparados con los que el agent esta
+/// mandando. Si el controller recibe bastante menos de lo que se
+/// manda (la red o el controller no dan abasto), bajamos calidad para
+/// aliviar; si recibe casi todo, subimos de a poco para aprovechar el
+/// ancho de banda disponible. Nunca sale de [QUALITY_MIN, QUALITY_MAX].
+fn adjust_quality(quality: &AtomicU8, produced_fps: f32, received_fps: f32) {
+    if produced_fps < 1.0 {
+        return; // todavia no hay suficiente informacion para decidir
+    }
+    let ratio = received_fps / produced_fps;
+    let current = quality.load(Ordering::Relaxed);
+
+    if ratio < 0.7 {
+        let new_quality = current.saturating_sub(5).max(QUALITY_MIN);
+        if new_quality != current {
+            quality.store(new_quality, Ordering::Relaxed);
+            tracing::info!(
+                "calidad bajada a {new_quality} (el controller recibe {received_fps:.1}/{produced_fps:.1} fps)"
+            );
+        }
+    } else if ratio > 0.9 && current < QUALITY_MAX {
+        let new_quality = (current + 2).min(QUALITY_MAX);
+        quality.store(new_quality, Ordering::Relaxed);
+        tracing::info!(
+            "calidad subida a {new_quality} (el controller recibe {received_fps:.1}/{produced_fps:.1} fps)"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -323,8 +360,15 @@ pub async fn run_agent() -> Result<()> {
     let frame_id = Arc::new(AtomicU64::new(0));
     let paired = Arc::new(AtomicBool::new(false));
     let crypto = Arc::new(CryptoState::default());
+    let quality = Arc::new(AtomicU8::new(QUALITY_INITIAL));
+    let produced_fps = Arc::new(Mutex::new(0f32));
 
-    spawn_capture_thread(Arc::clone(&latest), Arc::clone(&frame_id), Arc::clone(&paired));
+    spawn_capture_thread(
+        Arc::clone(&latest),
+        Arc::clone(&frame_id),
+        Arc::clone(&paired),
+        Arc::clone(&quality),
+    );
 
     let input_injector = InputInjector::new();
     let mut incoming_transfers: HashMap<u32, IncomingTransfer> = HashMap::new();
@@ -335,16 +379,22 @@ pub async fn run_agent() -> Result<()> {
     let mut p2p_attempted = false;
 
     // Tarea que manda por la red el ultimo frame disponible, cifrado
-    // si el handshake ya termino.
+    // si el handshake ya termino. Tambien lleva la cuenta de fps
+    // producidos (cuantos frames por segundo esta MANDANDO), que se
+    // compara contra lo que el controller reporta haber RECIBIDO para
+    // decidir si subir o bajar la calidad.
     {
         let latest = Arc::clone(&latest);
         let frame_id = Arc::clone(&frame_id);
         let paired = Arc::clone(&paired);
         let out_tx = out_tx.clone();
         let crypto = Arc::clone(&crypto);
+        let produced_fps = Arc::clone(&produced_fps);
         tokio::spawn(async move {
             let mut last_sent = 0u64;
             let mut sent_count = 0u64;
+            let mut frames_this_second = 0u32;
+            let mut second_start = tokio::time::Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 if !paired.load(Ordering::Relaxed) {
@@ -362,12 +412,20 @@ pub async fn run_agent() -> Result<()> {
                     match out_tx.send(Message::Binary(msg)) {
                         Ok(()) => {
                             sent_count += 1;
+                            frames_this_second += 1;
                             if sent_count == 1 || sent_count % 100 == 0 {
                                 tracing::info!("frame #{sent_count} mandado ({msg_len} bytes)");
                             }
                         }
                         Err(e) => tracing::warn!("no se pudo encolar el frame para mandar: {e}"),
                     }
+                }
+
+                if second_start.elapsed().as_secs_f32() >= 1.0 {
+                    let fps = frames_this_second as f32 / second_start.elapsed().as_secs_f32();
+                    *produced_fps.lock().unwrap() = fps;
+                    frames_this_second = 0;
+                    second_start = tokio::time::Instant::now();
                 }
             }
         });
@@ -468,6 +526,12 @@ pub async fn run_agent() -> Result<()> {
                     Some(netproto::KIND_INPUT) => handle_input_bytes(&input_injector, effective),
                     Some(netproto::KIND_CONTROL) => handle_control_bytes(&out_tx, &crypto, effective),
                     Some(netproto::KIND_FILE) => handle_file_bytes(&mut incoming_transfers, effective),
+                    Some(netproto::KIND_STATS) => {
+                        if let Some(received_fps) = netproto::decode_stats(effective) {
+                            let produced = *produced_fps.lock().unwrap();
+                            adjust_quality(&quality, produced, received_fps);
+                        }
+                    }
                     Some(netproto::KIND_P2P_CANDIDATE) => {
                         if let Some(addr) = netproto::decode_p2p_candidate(effective) {
                             let _ = peer_candidate_tx.send(addr);

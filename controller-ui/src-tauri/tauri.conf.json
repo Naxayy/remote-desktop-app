@@ -1,5 +1,5 @@
 {
-  "productName": "controller-ui",
+  "productName": "Remote Desktop App - Controller",
   "version": "0.1.0",
   "identifier": "com.nicolas.remotedesktopapp.controller",
   "build": {
@@ -16,6 +16,17 @@
     ]
   },
   "bundle": {
-    "icon": ["icons/icon.ico", "icons/icon.png"]
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "publisher": "Nicolas Carmona",
+    "copyright": "Copyright 2026 Nicolas Carmona",
+    "shortDescription": "Cliente de escritorio remoto para soporte tecnico",
+    "longDescription": "App controladora de Remote Desktop App: permite conectarse a PCs remotas para dar soporte tecnico, con video en vivo, control de mouse/teclado, transferencia de archivos y cifrado end-to-end.",
+    "windows": {
+      "wix": {
+        "language": "es-ES"
+      }
+    }
   }
 }

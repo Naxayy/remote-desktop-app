@@ -16,6 +16,7 @@ pub const KIND_FILE: u8 = 4;
 pub const KIND_P2P_CANDIDATE: u8 = 5;
 pub const KIND_KEY_EXCHANGE: u8 = 6;
 pub const KIND_ENCRYPTED: u8 = 7;
+pub const KIND_STATS: u8 = 8;
 
 /// Tamaño de cada pedazo al trocear un archivo para mandarlo. 64KB es
 /// chico de sobra para cualquier limite de tamaño de mensaje
@@ -221,6 +222,25 @@ pub fn decode_encrypted(data: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((&body[..12], &body[12..]))
 }
 
+/// Reporte periodico que el controller le manda al agent: cuantos fps
+/// esta recibiendo de verdad en el ultimo segundo. El agent lo usa
+/// para subir o bajar la calidad JPEG segun de que tan bien esta
+/// llegando el video - calidad adaptativa segun ancho de banda.
+pub fn encode_stats(received_fps: f32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5);
+    out.push(KIND_STATS);
+    out.extend_from_slice(&received_fps.to_le_bytes());
+    out
+}
+
+pub fn decode_stats(data: &[u8]) -> Option<f32> {
+    if data.first() != Some(&KIND_STATS) {
+        return None;
+    }
+    let body = data.get(1..5)?;
+    Some(f32::from_le_bytes(body.try_into().ok()?))
+}
+
 /// Transferencia de archivos entre agent y controller. Simetrico:
 /// cualquiera de los dos lados puede ser emisor o receptor - quien
 /// recibe un `Offer` simplemente empieza a escribir a disco.
@@ -414,5 +434,12 @@ mod tests {
         let (decoded_nonce, decoded_ct) = decode_encrypted(&encoded).unwrap();
         assert_eq!(decoded_nonce, &nonce);
         assert_eq!(decoded_ct, &ciphertext[..]);
+    }
+
+    #[test]
+    fn stats_roundtrip() {
+        let fps = 23.7f32;
+        let encoded = encode_stats(fps);
+        assert_eq!(decode_stats(&encoded), Some(fps));
     }
 }

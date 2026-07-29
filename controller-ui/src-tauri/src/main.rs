@@ -130,6 +130,12 @@ async fn connect(
         let mut incoming: HashMap<u32, IncomingTransfer> = HashMap::new();
         let received_dir = received_files_dir();
 
+        // Para el reporte de fps recibidos (calidad adaptativa): el
+        // agent usa esto para saber si tiene que subir o bajar la
+        // calidad JPEG.
+        let mut frames_this_second = 0u32;
+        let mut second_start = tokio::time::Instant::now();
+
         while let Some(msg) = read.next().await {
             let msg = match msg {
                 Ok(m) => m,
@@ -241,6 +247,18 @@ async fn connect(
                                 // backend Rust y el WebView.
                                 let b64 = STANDARD.encode(jpeg);
                                 let _ = app_handle.emit("video-frame", b64);
+                                frames_this_second += 1;
+                            }
+
+                            if second_start.elapsed().as_secs_f32() >= 1.0 {
+                                let fps = frames_this_second as f32 / second_start.elapsed().as_secs_f32();
+                                let stats_msg = {
+                                    let app_state = app_handle.state::<AppState>();
+                                    wrap_outgoing(&app_state.crypto, netproto::encode_stats(fps)).await
+                                };
+                                let _ = out_tx.send(Message::Binary(stats_msg));
+                                frames_this_second = 0;
+                                second_start = tokio::time::Instant::now();
                             }
                         }
                         Some(netproto::KIND_CONTROL) => {
