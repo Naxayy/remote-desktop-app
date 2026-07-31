@@ -141,6 +141,23 @@ button.danger:hover {
   align-items: center;
 }
 
+.control-toggle {
+  background: #3a3f4d;
+  color: #e5e7eb;
+}
+
+.control-toggle:hover {
+  background: #454b5c;
+}
+
+.control-toggle.active {
+  background: #2f9e5c;
+}
+
+.control-toggle.active:hover {
+  background: #278a4f;
+}
+
 #file-path-input {
   padding: 8px 10px;
   background: #0f1117;

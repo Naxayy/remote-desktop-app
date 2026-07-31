@@ -59,8 +59,13 @@ Write-Host "Configurando variables de entorno del sistema..."
 [System.Environment]::SetEnvironmentVariable("AGENT_CODE", $AgentCode, "Machine")
 
 # Si ya habia una instalacion previa, la sacamos primero para evitar
-# el error de "el servicio ya existe".
+# el error de "el servicio ya existe". Si NO habia instalacion previa
+# (caso normal, primera vez), esto va a fallar - es esperado, por eso
+# bajamos el ErrorActionPreference solo para esta linea.
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 & $agentExePath uninstall 2>$null | Out-Null
+$ErrorActionPreference = $previousPreference
 
 Write-Host "Registrando el servicio de Windows..."
 & $agentExePath install

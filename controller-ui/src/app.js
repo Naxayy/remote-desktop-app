@@ -17,6 +17,26 @@ const filePathInput = document.getElementById("file-path-input");
 const sendFileBtn = document.getElementById("send-file-btn");
 const restartBtn = document.getElementById("restart-btn");
 const disconnectBtn = document.getElementById("disconnect-btn");
+const controlToggleBtn = document.getElementById("control-toggle-btn");
+
+// Arranca siempre en modo solo-vista - se habilita a proposito.
+let controlEnabled = false;
+
+function updateControlButton() {
+  if (controlEnabled) {
+    controlToggleBtn.textContent = "🖱️ Control habilitado (click para solo vista)";
+    controlToggleBtn.classList.add("active");
+  } else {
+    controlToggleBtn.textContent = "🔒 Solo vista (click para controlar)";
+    controlToggleBtn.classList.remove("active");
+  }
+}
+
+controlToggleBtn.addEventListener("click", () => {
+  controlEnabled = !controlEnabled;
+  updateControlButton();
+  invoke("set_control_enabled", { enabled: controlEnabled }).catch(() => {});
+});
 
 // --- Mapeo de tecla fisica (event.code) a Virtual-Key Code de Windows.
 // Mismo mapeo que usa dev_viewer del lado Rust, para que ambos manden
@@ -68,6 +88,8 @@ connectBtn.addEventListener("click", async () => {
 
   try {
     await invoke("connect", { url, code });
+    controlEnabled = false;
+    updateControlButton();
     sessionStatus.textContent = `Esperando video de ${code}...`;
     showSession();
   } catch (e) {
@@ -118,6 +140,7 @@ listen("file-received", (event) => {
 
 // --- Input: mouse ---
 video.addEventListener("mousemove", (e) => {
+  if (!controlEnabled) return;
   const rect = video.getBoundingClientRect();
   const x = (e.clientX - rect.left) / rect.width;
   const y = (e.clientY - rect.top) / rect.height;
@@ -129,11 +152,13 @@ const BUTTON_MAP = { 0: 0, 2: 1, 1: 2 }; // JS: 0=left,1=middle,2=right -> nuest
 
 video.addEventListener("mousedown", (e) => {
   e.preventDefault();
+  if (!controlEnabled) return;
   invoke("send_mouse_button", { button: BUTTON_MAP[e.button] ?? 0, pressed: true }).catch(() => {});
 });
 
 video.addEventListener("mouseup", (e) => {
   e.preventDefault();
+  if (!controlEnabled) return;
   invoke("send_mouse_button", { button: BUTTON_MAP[e.button] ?? 0, pressed: false }).catch(() => {});
 });
 
@@ -141,6 +166,7 @@ video.addEventListener("contextmenu", (e) => e.preventDefault());
 
 video.addEventListener("wheel", (e) => {
   e.preventDefault();
+  if (!controlEnabled) return;
   const delta = e.deltaY < 0 ? 120 : -120;
   invoke("send_mouse_wheel", { delta }).catch(() => {});
 });
@@ -149,6 +175,7 @@ video.addEventListener("wheel", (e) => {
 // El <img> necesita tabindex para poder recibir foco y eventos de teclado.
 video.addEventListener("keydown", (e) => {
   e.preventDefault();
+  if (!controlEnabled) return;
   const vk = CODE_TO_VK[e.code];
   if (vk !== undefined) {
     invoke("send_key", { vk, pressed: true }).catch(() => {});
@@ -157,6 +184,7 @@ video.addEventListener("keydown", (e) => {
 
 video.addEventListener("keyup", (e) => {
   e.preventDefault();
+  if (!controlEnabled) return;
   const vk = CODE_TO_VK[e.code];
   if (vk !== undefined) {
     invoke("send_key", { vk, pressed: false }).catch(() => {});

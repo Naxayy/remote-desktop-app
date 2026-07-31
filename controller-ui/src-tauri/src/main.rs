@@ -54,13 +54,16 @@ async fn wrap_outgoing(crypto: &CryptoState, plaintext: Vec<u8>) -> Vec<u8> {
 }
 
 /// Estado compartido: el canal para mandar mensajes por la conexion
-/// activa, el path P2P directo si se logro establecer, y el estado
-/// de cifrado de la sesion actual.
+/// activa, el path P2P directo si se logro establecer, el estado de
+/// cifrado de la sesion actual, y si el control remoto (mouse/
+/// teclado) esta habilitado - arranca deshabilitado en cada conexion
+/// nueva, por seguridad: primero ves, despues decidis si controlar.
 #[derive(Default)]
 struct AppState {
     out_tx: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     p2p: Mutex<Option<(UdpSocket, std::net::SocketAddr)>>,
     crypto: CryptoState,
+    control_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Serialize, Clone)]
@@ -97,6 +100,10 @@ async fn connect(
 ) -> Result<(), String> {
     let (ws_stream, _) = connect_async(&url).await.map_err(|e| e.to_string())?;
     let (mut write, mut read) = ws_stream.split();
+
+    // Cada conexion nueva arranca en modo "solo vista" - el control
+    // remoto se habilita a proposito desde la UI, nunca por defecto.
+    state.control_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
     tokio::spawn(async move {
@@ -383,6 +390,11 @@ async fn send_bytes(state: &State<'_, AppState>, plaintext: Vec<u8>) -> Result<(
 /// relay de siempre via WebSocket. El input tambien se cifra en
 /// cualquiera de los dos caminos.
 async fn send_input_bytes(state: &State<'_, AppState>, plaintext: Vec<u8>) -> Result<(), String> {
+    if !state.control_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        // Control no habilitado - no mandamos nada. No es un error,
+        // es el comportamiento esperado en modo solo-vista.
+        return Ok(());
+    }
     let msg = wrap_outgoing(&state.crypto, plaintext).await;
     {
         let p2p_guard = state.p2p.lock().await;
@@ -397,6 +409,14 @@ async fn send_input_bytes(state: &State<'_, AppState>, plaintext: Vec<u8>) -> Re
         Some(tx) => tx.send(Message::Binary(msg)).map_err(|e| e.to_string()),
         None => Err("no hay conexion activa".to_string()),
     }
+}
+
+#[tauri::command]
+async fn set_control_enabled(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state
+        .control_enabled
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
 #[tauri::command]
@@ -459,6 +479,7 @@ fn main() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             connect,
+            set_control_enabled,
             send_mouse_move,
             send_mouse_button,
             send_mouse_wheel,

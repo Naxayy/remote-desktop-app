@@ -1,46 +1,64 @@
 # Instalador del agent
 
-Carpeta con todo lo necesario para instalar el agent en una PC remota
-sin que esa persona tenga que tocar Rust, git, ni nada del código
-fuente — solo necesita 2 archivos.
+Dos formas de instalar el agent en una PC remota, sin que esa persona
+toque Rust ni código fuente.
 
-## Armar el paquete para distribuir
+## Opción A (recomendada para clientes): instalador `.exe` con NSIS
 
-En tu PC (con el proyecto compilado):
+Un único `.exe` que, al ejecutarlo, le muestra al cliente una pantalla
+para elegir:
+- **Configuración recomendada**: usa tu servidor fijo (`wss://remote-desktop.skyguard.com.ar`,
+  definido dentro del `.nsi` — cambialo ahí si tu dominio cambia) +
+  un código alfanumérico generado al azar en el momento de instalar.
+- **Configuración personalizada**: la persona escribe su propio
+  servidor y código.
 
+**Requisito único (una sola vez, en tu PC):** instalar NSIS (gratis):
+https://nsis.sourceforge.io/Download — el instalador agrega `makensis`
+al PATH solo.
+
+**Armar el instalador:**
 ```powershell
-cd C:\Users\USUARIO\Desktop\remote-desktop-app
-cargo build --release -p agent --bin agent
-
-# Copiar el .exe a esta carpeta
-Copy-Item target\release\agent.exe agent\installer\
-
-# Comprimir todo en un zip para mandar
-Compress-Archive -Path agent\installer\* -DestinationPath agent-installer.zip -Force
+cd agent\installer
+.\build-installer.ps1
 ```
 
-Eso te deja `agent-installer.zip` con 3 archivos adentro:
-- `agent.exe`
-- `install-agent.ps1`
-- `uninstall-agent.ps1`
+Esto te deja `RemoteDesktopAppAgent-Setup.exe` en esa misma carpeta —
+ese único archivo es todo lo que le mandás al cliente. Al ejecutarlo:
+- Pide permiso de administrador (UAC)
+- Muestra la pantalla de configuración (recomendada / personalizada)
+- Instala el agent en `Program Files`
+- Configura la URL/código elegidos automáticamente
+- Registra e inicia el servicio de Windows
+- Muestra el código de conexión al terminar (para que se lo pases al
+  cliente si usó la opción recomendada con código al azar)
+- Queda con entrada en "Agregar o quitar programas" para desinstalar
+  fácil
 
-## Lo que tiene que hacer la persona que lo recibe
+## Opción B (para vos, o gente técnica): script de PowerShell
 
-1. Descomprimir el zip en cualquier carpeta.
+Más manual, pero no necesita NSIS instalado - útil para pruebas
+rápidas o si preferís pasarle la URL/código a mano en el momento:
+
+```powershell
+cargo build --release -p agent --bin agent
+Copy-Item ..\..\target\release\agent.exe .
+```
+
+Y le mandás `agent.exe` + `install-agent.ps1` + `uninstall-agent.ps1`
+(los 3 archivos de esta carpeta) a quien lo vaya a instalar. Instrucciones
+para esa persona:
+
+1. Descomprimir en cualquier carpeta.
 2. Click derecho sobre `install-agent.ps1` → **"Ejecutar con PowerShell"**
-   (si Windows no da esa opción directo, abrir PowerShell como
-   Administrador, `cd` hasta la carpeta, y correr `.\install-agent.ps1`).
-3. Si Windows bloquea el script por política de ejecución, correr antes
-   (una sola vez, como administrador):
+   (como administrador).
+3. Si Windows bloquea el script, correr antes (una vez, como admin):
    ```powershell
    Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
    ```
-4. El script va a pedir la URL del signaling server y el código de
-   conexión - se los pasás vos de antemano.
-
-Después de eso, el agent queda instalado como servicio de Windows,
-arranca solo con la PC, y no hace falta tocar nada más.
+4. El script pide la URL y el código por consola.
 
 ## Desinstalar
 
-Mismo procedimiento pero con `uninstall-agent.ps1`.
+- Instalador `.exe`: desde "Agregar o quitar programas" de Windows.
+- Script de PowerShell: correr `uninstall-agent.ps1` como administrador.
