@@ -323,6 +323,12 @@ fn adjust_quality(quality: &AtomicU8, produced_fps: f32, received_fps: f32) {
     }
 }
 
+fn generate_fallback_code() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    format!("{:06}", (nanos % 1_000_000) as u32)
+}
+
 #[cfg(windows)]
 mod service;
 
@@ -476,7 +482,15 @@ pub async fn run_agent() -> Result<()> {
                         paired.store(false, Ordering::Relaxed);
                     }
                     Some("error") => {
-                        tracing::warn!("error del signaling server: {}", parsed["message"]);
+                        let message = parsed["message"].as_str().unwrap_or("");
+                        tracing::warn!("error del signaling server: {message}");
+                        if message.contains("ya esta en uso") {
+                            let new_code = generate_fallback_code();
+                            tracing::info!("reintentando el registro con un codigo nuevo: {new_code}");
+                            let _ = out_tx.send(Message::Text(
+                                json!({"type": "register_agent", "code": new_code}).to_string(),
+                            ));
+                        }
                     }
                     _ => {}
                 }

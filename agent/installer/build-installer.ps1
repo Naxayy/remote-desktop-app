@@ -24,8 +24,14 @@ Push-Location $repoRoot
 cargo build --release -p agent --bin agent
 Pop-Location
 
-Write-Host "Copiando el binario a la carpeta del instalador..."
+Write-Host "Compilando agent-ui.exe (release)..."
+Push-Location $repoRoot
+cargo build --release -p agent-ui --bin agent-ui
+Pop-Location
+
+Write-Host "Copiando los binarios a la carpeta del instalador..."
 Copy-Item (Join-Path $repoRoot "target\release\agent.exe") $PSScriptRoot -Force
+Copy-Item (Join-Path $repoRoot "target\release\agent-ui.exe") $PSScriptRoot -Force
 
 $makensis = Get-Command makensis -ErrorAction SilentlyContinue
 if (-not $makensis) {

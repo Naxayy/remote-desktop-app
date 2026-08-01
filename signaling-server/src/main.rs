@@ -89,14 +89,28 @@ async fn handle_connection(stream: TcpStream, state: Arc<AppState>) -> Result<()
                 match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(ClientMessage::RegisterAgent { code }) => {
                         let code = code.unwrap_or_else(generate_code);
-                        state
-                            .pending_agents
-                            .lock()
-                            .unwrap()
-                            .insert(code.clone(), conn_id);
-                        registered_code = Some(code.clone());
-                        tracing::info!("agent {conn_id} registrado con codigo {code}");
-                        send_to(&state, conn_id, ServerMessage::Registered { code });
+                        let mut pending = state.pending_agents.lock().unwrap();
+                        if pending.contains_key(&code) {
+                            drop(pending);
+                            tracing::info!(
+                                "agent {conn_id} intento registrarse con codigo {code}, ya esta en uso"
+                            );
+                            send_to(
+                                &state,
+                                conn_id,
+                                ServerMessage::Error {
+                                    message: format!(
+                                        "el codigo '{code}' ya esta en uso por otro equipo conectado ahora mismo"
+                                    ),
+                                },
+                            );
+                        } else {
+                            pending.insert(code.clone(), conn_id);
+                            drop(pending);
+                            registered_code = Some(code.clone());
+                            tracing::info!("agent {conn_id} registrado con codigo {code}");
+                            send_to(&state, conn_id, ServerMessage::Registered { code });
+                        }
                     }
 
                     Ok(ClientMessage::Connect { code }) => {

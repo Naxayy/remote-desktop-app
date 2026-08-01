@@ -1,0 +1,30 @@
+[package]
+name = "agent-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Icono de bandeja + ventana de configuracion del agent (corre en la sesion del usuario, hace la captura/red real)."
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+core_engine = { path = "../../core-engine" }
+anyhow = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "=0.20.1", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+x25519-dalek = { version = "2", features = ["getrandom"] }
+
+# Mismos pines que en el resto del proyecto: evitan que este sandbox
+# (cargo 1.75) se tope con crates que ya requieren edition2024.
+[dependencies.idna_adapter]
+version = "=1.0.0"
+[dependencies.zeroize]
+version = "=1.7.0"
+[dependencies.zeroize_derive]
+version = "=1.4.2"

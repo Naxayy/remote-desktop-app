@@ -3,6 +3,13 @@
 Dos formas de instalar el agent en una PC remota, sin que esa persona
 toque Rust ni código fuente.
 
+Desde esta versión, el agent tiene un **ícono en la bandeja del
+sistema**: el cliente puede hacer click ahí para abrir una ventana
+chica donde ve/edita el servidor y el código de conexión, y puede
+desconectar manualmente. Eso lo maneja un segundo ejecutable,
+`agent-ui.exe`, que el servicio lanza solo en la sesión del usuario
+logueado - por eso ahora se empaquetan los dos `.exe` juntos.
+
 ## Opción A (recomendada para clientes): instalador `.exe` con NSIS
 
 Un único `.exe` que, al ejecutarlo, le muestra al cliente una pantalla
@@ -42,11 +49,14 @@ rápidas o si preferís pasarle la URL/código a mano en el momento:
 
 ```powershell
 cargo build --release -p agent --bin agent
+cargo build --release -p agent-ui --bin agent-ui
 Copy-Item ..\..\target\release\agent.exe .
+Copy-Item ..\..\target\release\agent-ui.exe .
 ```
 
-Y le mandás `agent.exe` + `install-agent.ps1` + `uninstall-agent.ps1`
-(los 3 archivos de esta carpeta) a quien lo vaya a instalar. Instrucciones
+Y le mandás `agent.exe` + `agent-ui.exe` + `install-agent.ps1` +
+`uninstall-agent.ps1` (los 4 archivos de esta carpeta) a quien lo vaya
+a instalar. Instrucciones
 para esa persona:
 
 1. Descomprimir en cualquier carpeta.

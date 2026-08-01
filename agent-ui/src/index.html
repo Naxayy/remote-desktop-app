@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Remote Desktop App - Configuración</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="card">
+      <h1>Remote Desktop App</h1>
+      <p id="status" class="status">Conectando...</p>
+
+      <label>Servidor</label>
+      <input id="signaling-url" type="text" />
+
+      <label>Código de conexión</label>
+      <input id="agent-code" type="text" maxlength="12" />
+
+      <div class="actions">
+        <button id="save-btn">Guardar y reconectar</button>
+        <button id="disconnect-btn" class="secondary">Desconectar</button>
+      </div>
+
+      <p class="hint">Cerrar esta ventana no apaga el agent - queda corriendo en la bandeja del sistema. Hacé click en el ícono para volver a abrirla.</p>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

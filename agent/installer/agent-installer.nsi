@@ -136,6 +136,7 @@ FunctionEnd
 Section "Instalar" SecInstall
     SetOutPath "$INSTDIR"
     File "agent.exe"
+    File "agent-ui.exe"
 
     WriteRegStr HKLM "Software\RemoteDesktopAppAgent" "InstallDir" "$INSTDIR"
 
@@ -170,6 +171,7 @@ Section "Uninstall"
     nsExec::ExecToLog '"$INSTDIR\agent.exe" uninstall'
 
     Delete "$INSTDIR\agent.exe"
+    Delete "$INSTDIR\agent-ui.exe"
     Delete "$INSTDIR\uninstall.exe"
     RMDir "$INSTDIR"
 

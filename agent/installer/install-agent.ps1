@@ -31,10 +31,16 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 
 $installDir = "$env:ProgramFiles\RemoteDesktopAppAgent"
 $exeName = "agent.exe"
+$uiExeName = "agent-ui.exe"
 $sourceExe = Join-Path $PSScriptRoot $exeName
+$sourceUiExe = Join-Path $PSScriptRoot $uiExeName
 
 if (-not (Test-Path $sourceExe)) {
     Write-Error "No se encontro '$exeName' en la misma carpeta que este script ($PSScriptRoot). Copia agent.exe ahi antes de instalar."
+    exit 1
+}
+if (-not (Test-Path $sourceUiExe)) {
+    Write-Error "No se encontro '$uiExeName' en la misma carpeta que este script ($PSScriptRoot). Copia agent-ui.exe ahi antes de instalar."
     exit 1
 }
 
@@ -49,6 +55,7 @@ Write-Host ""
 Write-Host "Instalando en $installDir..."
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 Copy-Item -Path $sourceExe -Destination $installDir -Force
+Copy-Item -Path $sourceUiExe -Destination $installDir -Force
 $agentExePath = Join-Path $installDir $exeName
 
 Write-Host "Configurando variables de entorno del sistema..."

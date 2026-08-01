@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "core-engine",
     "agent",
+    "agent-ui/src-tauri",
     "signaling-server",
     "relay-server",
     "controller-ui/src-tauri",

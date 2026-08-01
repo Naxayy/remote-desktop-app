@@ -9,9 +9,10 @@
 //! (DXGI Desktop Duplication falla con DXGI_ERROR_NOT_CURRENTLY_
 //! AVAILABLE si lo intenta). La solucion estandar (la misma que usan
 //! TeamViewer/AnyDesk) es que el servicio no capture nada el mismo:
-//! detecta la sesion del usuario logueado y lanza ahi un proceso
-//! "worker" (este mismo .exe, en modo `console`) usando su token -
-//! ese proceso SI tiene acceso al escritorio real.
+//! detecta la sesion del usuario logueado y lanza ahi el proceso
+//! "worker" (agent-ui.exe, instalado al lado de este .exe) usando su
+//! token - ese proceso SI tiene acceso al escritorio real, y de paso
+//! le da al usuario un icono de bandeja + ventana de configuracion.
 //!
 //! Nota: este archivo se escribio sin poder compilarlo (entorno
 //! Linux) y es la parte mas dificil de todo el proyecto de probar
@@ -133,10 +134,10 @@ fn init_service_logging() {
     }
 }
 
-/// Intenta lanzar el proceso worker (este mismo .exe, en modo
-/// `console`) dentro de la sesion del usuario actualmente logueado en
-/// la consola activa. Ese proceso SI tiene acceso al escritorio real
-/// (a diferencia de este servicio, que corre en la sesion 0).
+/// Intenta lanzar el proceso worker (agent-ui.exe) dentro de la
+/// sesion del usuario actualmente logueado en la consola activa. Ese
+/// proceso SI tiene acceso al escritorio real (a diferencia de este
+/// servicio, que corre en la sesion 0).
 /// Devuelve el handle del proceso lanzado si funciono.
 fn launch_session_worker(exe_path: &str) -> Option<PROCESS_INFORMATION> {
     unsafe {
@@ -179,7 +180,7 @@ fn launch_session_worker(exe_path: &str) -> Option<PROCESS_INFORMATION> {
 
         let mut process_info = PROCESS_INFORMATION::default();
 
-        let mut cmd_line: Vec<u16> = format!("\"{exe_path}\" console")
+        let mut cmd_line: Vec<u16> = format!("\"{exe_path}\"")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -291,10 +292,15 @@ fn run_service() -> Result<()> {
         process_id: None,
     })?;
 
+    // El worker que hace la captura real ya NO es este mismo binario -
+    // es agent-ui.exe, instalado al lado de agent.exe (tiene la UI de
+    // bandeja/configuracion). Calculamos su ruta como hermano del
+    // ejecutable actual.
     let exe_path = std::env::current_exe()
         .ok()
+        .and_then(|p| p.parent().map(|dir| dir.join("agent-ui.exe")))
         .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_else(|| SERVICE_NAME.to_string());
+        .unwrap_or_else(|| "agent-ui.exe".to_string());
 
     {
         let should_stop = Arc::clone(&should_stop);
