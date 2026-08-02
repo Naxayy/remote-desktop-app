@@ -514,6 +514,22 @@ async fn save_and_reconnect(
 }
 
 fn main() {
+    // Capturamos panics y los escribimos al log - sin esto, un panic
+    // en una app sin consola (windows_subsystem = "windows") muere en
+    // silencio total, sin dejar ningun rastro de que paso ni por que.
+    std::panic::set_hook(Box::new(|info| {
+        let log_dir = std::path::Path::new("C:\\ProgramData\\RemoteDesktopAppAgent");
+        let _ = std::fs::create_dir_all(log_dir);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("agent-ui.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "PANIC: {info}");
+        }
+    }));
+
     let log_dir = std::path::Path::new("C:\\ProgramData\\RemoteDesktopAppAgent");
     let _ = std::fs::create_dir_all(log_dir);
     if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("agent-ui.log")) {
@@ -537,12 +553,19 @@ fn main() {
                 *state.connection_task.lock().await = Some(handle);
             });
 
+            let icon_bytes = include_bytes!("../icons/icon.png");
+            let decoded = image::load_from_memory(icon_bytes)
+                .expect("el icono embebido deberia ser un PNG valido")
+                .into_rgba8();
+            let (icon_width, icon_height) = (decoded.width(), decoded.height());
+            let tray_icon = tauri::image::Image::new_owned(decoded.into_raw(), icon_width, icon_height);
+
             let show_item = MenuItemBuilder::with_id("show", "Configurar...").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Salir").build(app)?;
             let menu = MenuBuilder::new(app).items(&[&show_item, &quit_item]).build()?;
 
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tray_icon)
                 .menu(&menu)
                 .tooltip("Remote Desktop App - Agent")
                 .on_menu_event(|app, event| match event.id.as_ref() {
